@@ -11,6 +11,8 @@ Tools:
 - sandbox_status: Inspect sandbox state, packages, and resource usage
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -20,7 +22,6 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 from onit_sandbox.server import (
     DEFAULT_CPU_QUOTA,
@@ -66,8 +67,8 @@ class SandboxManager:
     def __init__(self) -> None:
         self._containers: dict[str, ContainerInfo] = {}
         self._lock = threading.Lock()
-        self._docker_available: Optional[bool] = None
-        self._gpu_available: Optional[bool] = None
+        self._docker_available: bool | None = None
+        self._gpu_available: bool | None = None
 
     def _check_docker(self) -> bool:
         """Check if Docker is available and running."""
@@ -202,7 +203,8 @@ class SandboxManager:
                     container_id,
                     "sh",
                     "-c",
-                    "mkdir -p /home/sandbox/.cache/pip /home/sandbox/.local && chown -R 1000:1000 /home/sandbox",
+                    "mkdir -p /home/sandbox/.cache/pip /home/sandbox/.local"
+                    " && chown -R 1000:1000 /home/sandbox",
                 ],
                 capture_output=True,
                 timeout=10,
@@ -259,7 +261,7 @@ class SandboxManager:
         command: str,
         timeout: int = DEFAULT_TIMEOUT,
         workdir: str = "/workspace",
-        env: Optional[dict] = None,
+        env: dict | None = None,
         split_output: bool = False,
     ) -> tuple[int, str] | tuple[int, str, str]:
         """Execute a command inside a container.
@@ -348,7 +350,7 @@ class SandboxManager:
             for session_id in list(self._containers.keys()):
                 self.stop_container(session_id)
 
-    def get_container_stats(self, container_id: str) -> Optional[dict]:
+    def get_container_stats(self, container_id: str) -> dict | None:
         """Get resource usage stats for a container."""
         try:
             result = subprocess.run(
@@ -380,7 +382,7 @@ class SandboxManager:
 # ---------------------------------------------------------------------------
 
 DATA_PATH = os.path.join(tempfile.gettempdir(), "onit", "data")
-SESSION_ID: Optional[str] = None
+SESSION_ID: str | None = None
 
 _manager = SandboxManager()
 _server = SandboxMCPServer()
@@ -432,7 +434,7 @@ Examples:
   install_packages(packages="numpy matplotlib")
   install_packages(packages="torch torchvision --index-url https://download.pytorch.org/whl/cpu")""",
 )
-def install_packages(packages: Optional[str] = None) -> str:
+def install_packages(packages: str | None = None) -> str:
     if not packages:
         return json.dumps({"status": "error", "error": "No packages specified"}, indent=2)
 
@@ -489,7 +491,8 @@ def install_packages(packages: Optional[str] = None) -> str:
                 "packages": packages,
                 "installed": [],
                 "status": "error",
-                "output": "Docker is not available. Please install Docker and ensure it is running.",
+                "output": "Docker is not available. "
+                "Please install Docker and ensure it is running.",
             },
             indent=2,
         )
@@ -520,7 +523,7 @@ Examples:
   run_code(command="python -c 'import numpy; print(numpy.__version__)'")""",
 )
 def run_code(
-    command: Optional[str] = None,
+    command: str | None = None,
     timeout: int = 120,
 ) -> str:
     if not command:
@@ -571,7 +574,8 @@ def run_code(
             {
                 "command": command,
                 "stdout": "",
-                "stderr": "Docker is not available. Please install Docker and ensure it is running.",
+                "stderr": "Docker is not available. "
+                "Please install Docker and ensure it is running.",
                 "returncode": -1,
                 "status": "error",
                 "files_created": [],
@@ -598,7 +602,8 @@ def run_code(
     description="""Check the status of the code execution environment.
 Shows whether the sandbox is running, what packages are installed, and resource usage.
 
-Returns JSON: {status, python_version, installed_packages, disk_usage_mb, uptime_seconds, gpu_available}""",
+Returns JSON: {status, python_version, installed_packages,
+disk_usage_mb, uptime_seconds, gpu_available}""",
 )
 def sandbox_status() -> str:
     try:

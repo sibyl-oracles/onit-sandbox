@@ -5,6 +5,8 @@ Provides start / stop / status subcommands with PID-file management,
 mirroring the pattern used in onit-workspace.
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import signal
@@ -12,7 +14,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 from onit_sandbox.server import DEFAULT_HOST, DEFAULT_PORT
 
@@ -26,7 +27,7 @@ def _ensure_state_dir() -> None:
     STATE_DIR.mkdir(mode=0o700, exist_ok=True)
 
 
-def _get_pid() -> Optional[int]:
+def _get_pid() -> int | None:
     """Read stored PID, or None."""
     if PID_FILE.exists():
         try:
@@ -74,7 +75,7 @@ def cmd_start(args: argparse.Namespace) -> None:
 
 def _run_foreground(args: argparse.Namespace) -> None:
     """Run the server in the foreground (blocking)."""
-    from onit_sandbox.mcp_server import _server, mcp  # noqa: F811
+    from onit_sandbox.mcp_server import _server  # noqa: F811
 
     _server.host = args.host
     _server.port = args.port

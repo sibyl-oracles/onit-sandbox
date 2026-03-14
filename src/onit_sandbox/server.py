@@ -5,10 +5,11 @@ Provides the SandboxMCPServer class that wraps FastMCP with
 host/port/path configuration and lifecycle management.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -45,7 +46,7 @@ class SandboxMCPServer:
     transport: str = "sse"
     verbose: bool = False
 
-    _mcp: Optional[FastMCP] = field(default=None, init=False, repr=False)
+    _mcp: FastMCP | None = field(default=None, init=False, repr=False)
 
     @property
     def mcp(self) -> FastMCP:

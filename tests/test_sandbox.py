@@ -6,16 +6,16 @@ These tests verify the sandbox functionality with and without Docker.
 
 import json
 import os
-import tempfile
+
 import pytest
 
 import onit_sandbox.mcp_server as mcp_module
 from onit_sandbox.mcp_server import (
     SandboxManager,
+    cleanup_sandbox,
     install_packages,
     run_code,
     sandbox_status,
-    cleanup_sandbox,
 )
 
 
