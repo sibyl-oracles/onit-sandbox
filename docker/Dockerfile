@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.title="onit-sandbox"
+LABEL org.opencontainers.image.description="Isolated Python execution sandbox for MCP agents"
+LABEL org.opencontainers.image.source="https://github.com/sibyl-oracles/onit-sandbox"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
 # Create non-root user for security
 RUN useradd -m -u 1000 sandbox
 

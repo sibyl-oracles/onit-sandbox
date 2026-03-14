@@ -1,145 +1,150 @@
 # onit-sandbox
 
-A Docker-based code execution sandbox MCP server for safe Python project execution.
+[![PyPI version](https://img.shields.io/pypi/v/onit-sandbox.svg)](https://pypi.org/project/onit-sandbox/)
+[![Python](https://img.shields.io/pypi/pyversions/onit-sandbox.svg)](https://pypi.org/project/onit-sandbox/)
+[![CI](https://github.com/sibyl-oracles/onit-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/sibyl-oracles/onit-sandbox/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-## Overview
+A Docker-based code execution sandbox [MCP server](https://modelcontextprotocol.io/) for safe Python execution. Gives LLM agents an isolated environment where they can install packages, run code, and produce artifacts — without touching the host system.
 
-The Sandbox MCP Server provides isolated Docker containers for executing Python code with full package installation capabilities. Unlike traditional bash MCP servers that block package managers and restrict operations, this sandbox allows agents to:
+## Why onit-sandbox?
 
-- **Install packages**: `pip install numpy matplotlib scipy` works seamlessly
-- **Run full projects**: Execute Python scripts, run tests, build simulations
-- **Stay secure**: All execution is isolated in Docker containers with resource limits
+Traditional bash-based MCP tools block package managers and restrict operations. **onit-sandbox** lifts those restrictions safely by running everything inside per-session Docker containers with resource limits and network isolation.
+
+- **Install any package** — `pip install numpy matplotlib torch` just works
+- **Run full projects** — execute scripts, run tests, build simulations
+- **Stay secure** — containers are resource-limited, network-isolated, and non-root
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────┐
-│  OnIt Agent (chat loop)              │
+│  LLM Agent (chat loop)              │
 │  ┌────────────────────────────────┐  │
-│  │ ToolsMCPServer (existing)      │  │
-│  │  bash, read_file, write_file…  │  │
-│  └────────────────────────────────┘  │
-│  ┌────────────────────────────────┐  │
-│  │ SandboxMCPServer (NEW)         │  │
-│  │  sandbox_install               │  │
-│  │  sandbox_run                   │  │
+│  │ SandboxMCPServer               │  │
+│  │  install_packages              │  │
+│  │  run_code                      │  │
 │  │  sandbox_status                │  │
-│  │  sandbox_cleanup               │  │
 │  └──────────┬─────────────────────┘  │
-│             │ Docker SDK              │
+│             │ Docker CLI              │
 │  ┌──────────▼─────────────────────┐  │
 │  │ Docker Container (per-session) │  │
-│  │  - python:3.12-slim image      │  │
+│  │  - python:3.12-slim base       │  │
 │  │  - Full pip access             │  │
 │  │  - Workspace bind-mounted      │  │
 │  │  - CPU/mem/network limits      │  │
-│  │  - auto-cleanup on session end │  │
+│  │  - Auto-cleanup on stop        │  │
 │  └────────────────────────────────┘  │
 └──────────────────────────────────────┘
 ```
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.10+
-- Docker (install from [docker.com](https://docs.docker.com/get-docker/))
-
-### Quick Start
+### From PyPI
 
 ```bash
-# Clone the repository
-git clone https://github.com/sibyl-oracles/onit-sandbox.git
-cd onit-sandbox
-
-# Run setup (creates venv, installs deps, builds Docker image)
-chmod +x setup.sh
-./setup.sh
-
-# Activate virtual environment
-source .venv/bin/activate
-
-# Start the server (runs in background)
-onit-sandbox start
-
-# Or run in foreground
-onit-sandbox start --foreground
-
-# Stop the server
-onit-sandbox stop
-
-# Check status
-onit-sandbox status
+pip install onit-sandbox
 ```
 
-### Manual Installation
+### From source
 
 ```bash
-# Install Python dependencies
+git clone https://github.com/sibyl-oracles/onit-sandbox.git
+cd onit-sandbox
 pip install -e .
+```
 
-# Build the Docker image
+### Prerequisites
+
+- **Python 3.10+**
+- **Docker** — install from [docker.com](https://docs.docker.com/get-docker/)
+
+## Docker Image
+
+The sandbox runs code inside a custom Docker image pre-loaded with common scientific packages.
+
+### Pull from GitHub Container Registry
+
+```bash
+docker pull ghcr.io/sibyl-oracles/onit-sandbox:latest
+```
+
+Then set the image name so the server uses it:
+
+```bash
+export SANDBOX_IMAGE=ghcr.io/sibyl-oracles/onit-sandbox:latest
+```
+
+### Build locally
+
+```bash
 cd docker
 chmod +x build.sh
 ./build.sh
 ```
 
-## Tools
+This builds `onit-sandbox:latest` locally. The image includes:
 
-### `sandbox_install`
+| Package | Description |
+|---------|-------------|
+| numpy | Numerical computing |
+| matplotlib | Plotting and visualization |
+| scipy | Scientific computing |
+| pandas | Data manipulation |
+| scikit-learn | Machine learning |
+| sympy | Symbolic mathematics |
+| pytest | Testing framework |
 
-Install Python packages inside the sandbox container.
+### Fallback
+
+If no custom image is found, the server falls back to `python:3.12-slim` automatically. Packages can still be installed at runtime via `install_packages`.
+
+## Quick Start
+
+```bash
+# Start the MCP server (background)
+onit-sandbox start
+
+# Start in foreground (useful for debugging)
+onit-sandbox start --foreground
+
+# Check status
+onit-sandbox status
+
+# Stop the server
+onit-sandbox stop
+```
+
+The server runs on `http://0.0.0.0:18205/sse` by default.
+
+## MCP Tools
+
+### `install_packages`
+
+Install Python packages inside the sandbox via pip. Network is temporarily enabled for PyPI access, then disabled again.
 
 ```json
 {
   "packages": "numpy matplotlib scipy",
-  "session_id": "my-session",
-  "data_path": "/path/to/workspace"
-}
-```
-
-**Features:**
-- Temporarily enables network for PyPI access
-- Packages persist for the session lifetime
-- Network disabled after installation for security
-
-### `sandbox_run`
-
-Execute commands inside the sandbox container.
-
-```json
-{
-  "command": "python simulation.py",
-  "session_id": "my-session",
-  "data_path": "/path/to/workspace",
-  "timeout": 60
-}
-```
-
-**Features:**
-- Workspace directory mounted at `/workspace`
-- Files written by agents are immediately accessible
-- Output captured and returned (truncated to 10KB)
-
-### `sandbox_status`
-
-Check sandbox state and resource usage.
-
-```json
-{
   "session_id": "my-session"
 }
 ```
 
-**Returns:**
-- Container state (running, stopped)
-- Installed packages list
-- Resource usage (CPU, memory)
-- Creation timestamp
+### `run_code`
 
-### `sandbox_cleanup`
+Execute shell commands inside the sandbox. Files written by `write_file` are available in the working directory. Output is captured and returned (truncated to 10 KB).
 
-Stop and remove the sandbox container.
+```json
+{
+  "command": "python simulation.py",
+  "timeout": 120,
+  "session_id": "my-session"
+}
+```
+
+### `sandbox_status`
+
+Check sandbox state — container health, Python version, installed packages, disk usage, uptime, and GPU availability.
 
 ```json
 {
@@ -148,6 +153,19 @@ Stop and remove the sandbox container.
 ```
 
 ## Configuration
+
+### CLI Options
+
+```
+onit-sandbox start [OPTIONS]
+
+  --host         Host to bind to (default: 0.0.0.0)
+  --port         Port to bind to (default: 18205)
+  --transport    sse or stdio (default: sse)
+  --foreground   Run in foreground
+  --verbose      Enable verbose logging
+  --data-path    Workspace data directory (default: /tmp/onit/data)
+```
 
 ### Environment Variables
 
@@ -161,7 +179,7 @@ Stop and remove the sandbox container.
 | `SANDBOX_DEFAULT_TIMEOUT` | `60` | Default command timeout (seconds) |
 | `SANDBOX_INSTALL_TIMEOUT` | `300` | Package install timeout (seconds) |
 
-### Server Configuration
+### YAML Configuration
 
 ```yaml
 # configs/default.yaml
@@ -191,26 +209,30 @@ mcp_servers:
     enabled: true
 ```
 
-### Session Cleanup
-
-Call `cleanup_sandbox(session_id)` during session teardown:
+### Programmatic Usage
 
 ```python
-from onit_sandbox.mcp_server import cleanup_sandbox
+from onit_sandbox.mcp_server import run, cleanup_sandbox
 
-# In session cleanup code
-cleanup_sandbox(session_id)
+# Start the server
+run(transport="sse", host="0.0.0.0", port=18205)
+
+# Cleanup a session's container
+cleanup_sandbox(session_id="my-session")
 ```
 
 ## Security
 
 ### Isolation Features
 
-- **Container isolation**: Full filesystem, process, and network isolation
-- **Non-root execution**: All code runs as user `sandbox` (UID 1000)
-- **Resource limits**: Memory (512MB), CPU (1 core), PIDs (100)
-- **Network disabled by default**: Only enabled during `sandbox_install`
-- **Auto-cleanup**: Containers removed when stopped (`--rm` flag)
+| Layer | Protection |
+|-------|-----------|
+| Filesystem | Container isolation — only mounted workspace is accessible |
+| User | Non-root execution as `sandbox` (UID 1000) |
+| Resources | Memory (512 MB), CPU (1 core), PIDs (100) |
+| Network | Disabled by default — enabled only during `install_packages` |
+| Lifecycle | Containers auto-removed on stop (`--rm` flag) |
+| GPU | Optional NVIDIA GPU passthrough when available |
 
 ### What's Blocked
 
@@ -221,95 +243,61 @@ cleanup_sandbox(session_id)
 
 ### What's Allowed
 
-- Full PyPI access during `sandbox_install`
+- Full PyPI access during `install_packages`
 - Read/write to mounted workspace
 - Python execution with any installed packages
 - Shell commands within resource limits
 
-## Pre-installed Packages
-
-The `onit-sandbox:latest` image includes:
-
-- numpy
-- matplotlib
-- scipy
-- pandas
-- scikit-learn
-- sympy
-- pytest
-
 ## Development
+
+### Setup
+
+```bash
+# Clone and install with dev dependencies
+git clone https://github.com/sibyl-oracles/onit-sandbox.git
+cd onit-sandbox
+pip install -e ".[dev]"
+
+# Or use the setup script (creates venv, builds Docker image)
+chmod +x setup.sh
+./setup.sh
+```
 
 ### Running Tests
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
+# All tests
 pytest tests/ -v
 
-# Run tests (skip Docker-dependent tests if Docker unavailable)
+# Skip Docker-dependent tests
 pytest tests/ -v -k "not Docker"
 ```
 
-### Building the Docker Image
+### Code Quality
 
 ```bash
-cd docker
-./build.sh
+black src/ tests/        # Format
+ruff check src/ tests/   # Lint
+mypy src/                # Type check
 ```
 
-### Code Style
+### Publishing a Release
 
-```bash
-# Format code
-black src/ tests/
-
-# Lint
-ruff check src/ tests/
-
-# Type check
-mypy src/
-```
+1. Update the version in [pyproject.toml](pyproject.toml)
+2. Create a GitHub release with a tag matching the version (e.g., `v0.1.0`)
+3. The [publish workflow](.github/workflows/publish.yml) automatically builds and uploads to PyPI
+4. The [docker workflow](.github/workflows/docker.yml) automatically builds and pushes the container image to GHCR
 
 ## Troubleshooting
 
-### Docker not available
-
-```
-Error: Docker is not available. Please install Docker and ensure it is running.
-```
-
-**Solution:** Install Docker and start the Docker daemon:
-- macOS: Install Docker Desktop
-- Linux: `sudo systemctl start docker`
-
-### Sandbox image not found
-
-```
-Warning: Using fallback image python:3.12-slim
-```
-
-**Solution:** Build the optimized image:
-```bash
-cd docker && ./build.sh
-```
-
-### Permission denied on workspace
-
-**Solution:** Ensure the workspace directory is writable:
-```bash
-chmod -R 777 /path/to/workspace
-```
-
-### Container timeout
-
-**Solution:** Increase timeout or optimize your code:
-```python
-sandbox_run("python slow_script.py", timeout=300)
-```
+| Problem | Solution |
+|---------|----------|
+| Docker not available | Install Docker and start the daemon (`sudo systemctl start docker` on Linux, or open Docker Desktop on macOS) |
+| Sandbox image not found | Build locally with `cd docker && ./build.sh` or pull from GHCR |
+| Permission denied on workspace | `chmod -R 777 /path/to/workspace` |
+| Command timeout | Increase timeout: `run_code(command="...", timeout=300)` |
+| Port already in use | Use `--port` flag: `onit-sandbox start --port 18206` |
 
 ## License
 
-Apache License 2.0 - See [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
