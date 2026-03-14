@@ -1,0 +1,20 @@
+# Example MCP client configuration for OnIt integration
+# Add this to your main OnIt configs/default.yaml under the mcp_servers section
+
+mcp_servers:
+  - name: SandboxMCPServer
+    description: Python code execution sandbox with package installation
+    url: http://127.0.0.1:18205/sse
+    enabled: true
+
+# Example MCP server entry for the server registry
+# Add this to your main OnIt configs/default.yaml under the mcp_server_registry section
+
+mcp_server_registry:
+  - name: SandboxMCPServer
+    module: onit_sandbox
+    enabled: true
+    host: 0.0.0.0
+    port: 18205
+    path: /sse
+    transport: 'sse'

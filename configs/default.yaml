@@ -1,0 +1,35 @@
+# Sandbox MCP Server Configuration
+# This file contains the default configuration for the sandbox server
+
+server:
+  name: SandboxMCPServer
+  description: Python code execution sandbox with package installation
+  host: 0.0.0.0
+  port: 18205
+  path: /sse
+  transport: sse
+  enabled: true
+
+docker:
+  # Primary image - built from docker/Dockerfile
+  sandbox_image: onit-sandbox:latest
+  # Fallback image if sandbox_image not available
+  fallback_image: python:3.12-slim
+  
+  # Resource limits
+  memory_limit: 512m
+  cpu_quota: 100000  # 1 CPU
+  pids_limit: 100
+  
+  # Network settings
+  network_disabled_default: true
+  
+  # Timeouts (in seconds)
+  default_timeout: 60
+  install_timeout: 300
+  max_timeout: 600
+
+# Logging configuration
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
