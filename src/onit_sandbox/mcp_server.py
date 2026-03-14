@@ -104,9 +104,7 @@ class SandboxManager:
                 text=True,
                 timeout=10,
             )
-            self._gpu_available = (
-                result.returncode == 0 and "nvidia" in result.stdout.lower()
-            )
+            self._gpu_available = result.returncode == 0 and "nvidia" in result.stdout.lower()
         except (subprocess.TimeoutExpired, FileNotFoundError):
             self._gpu_available = False
 
@@ -436,9 +434,7 @@ Examples:
 )
 def install_packages(packages: Optional[str] = None) -> str:
     if not packages:
-        return json.dumps(
-            {"status": "error", "error": "No packages specified"}, indent=2
-        )
+        return json.dumps({"status": "error", "error": "No packages specified"}, indent=2)
 
     session_id = _get_session_id()
     data_path = _get_data_path()
@@ -468,17 +464,11 @@ def install_packages(packages: Optional[str] = None) -> str:
                 # Parse successfully installed packages from pip output
                 for line in output.split("\n"):
                     if line.strip().startswith("Successfully installed"):
-                        installed = [
-                            pkg.rsplit("-", 1)[0]
-                            for pkg in line.strip().split()[2:]
-                        ]
+                        installed = [pkg.rsplit("-", 1)[0] for pkg in line.strip().split()[2:]]
                         break
                 if not installed:
                     # Fallback: assume requested packages were installed
-                    installed = [
-                        p for p in packages.split()
-                        if not p.startswith("-")
-                    ]
+                    installed = [p for p in packages.split() if not p.startswith("-")]
                 container_info.installed_packages.extend(installed)
 
             return json.dumps(
@@ -534,9 +524,7 @@ def run_code(
     timeout: int = 120,
 ) -> str:
     if not command:
-        return json.dumps(
-            {"status": "error", "error": "No command specified"}, indent=2
-        )
+        return json.dumps({"status": "error", "error": "No command specified"}, indent=2)
 
     timeout = min(timeout, 600)
     session_id = _get_session_id()
@@ -739,7 +727,10 @@ def run(transport="sse", host="0.0.0.0", port=18202, path="/sse", options=None):
 
     logger.info(
         "Starting Sandbox MCP Server on http://%s:%s%s (transport: %s)",
-        host, port, path, transport,
+        host,
+        port,
+        path,
+        transport,
     )
     _server.run()
 
