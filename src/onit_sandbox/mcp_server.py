@@ -414,12 +414,26 @@ _server = SandboxMCPServer()
 mcp = _server.mcp
 
 
-def _get_session_id() -> str:
-    return SESSION_ID or str(uuid.uuid4())
+def _get_session_id(session_id: str | None = None) -> str:
+    """Return a session ID, using the caller-supplied value if given.
+
+    When no *session_id* is provided the module-level default is used.  If that
+    is also ``None`` a new UUID is generated once and cached so that all
+    subsequent calls within the same process share the same default session.
+    """
+    if session_id:
+        return session_id
+    global SESSION_ID
+    if SESSION_ID is None:
+        SESSION_ID = str(uuid.uuid4())
+    return SESSION_ID
 
 
-def _get_data_path() -> str:
-    return DATA_PATH
+def _get_data_path(session_id: str | None = None) -> str:
+    """Return the workspace data path, namespaced by *session_id* when given."""
+    base = DATA_PATH
+    sid = _get_session_id(session_id)
+    return os.path.join(base, sid)
 
 
 def _list_workspace_files(container_id: str) -> set[str]:
@@ -452,6 +466,8 @@ Multiple packages can be specified in a single call, separated by spaces.
 Args:
 - packages: Space-separated package names with optional versions
   (e.g., "numpy matplotlib", "scipy==1.12.0 pandas>=2.0")
+- session_id: Optional identifier to isolate this sandbox from other agents.
+  Calls with the same session_id share a container; different IDs get separate containers.
 
 Returns JSON: {packages, installed, status, output}
 
@@ -459,12 +475,12 @@ Examples:
   install_packages(packages="numpy matplotlib")
   install_packages(packages="torch torchvision --index-url https://download.pytorch.org/whl/cpu")""",
 )
-def install_packages(packages: str | None = None) -> str:
+def install_packages(packages: str | None = None, session_id: str | None = None) -> str:
     if not packages:
         return json.dumps({"status": "error", "error": "No packages specified"}, indent=2)
 
-    session_id = _get_session_id()
-    data_path = _get_data_path()
+    session_id = _get_session_id(session_id)
+    data_path = _get_data_path(session_id)
 
     try:
         container_info = _manager.get_or_create_container(session_id, data_path)
@@ -539,6 +555,8 @@ Generated output files (plots, CSVs, etc.) will also appear in the working direc
 Args:
 - command: The command to execute (e.g., "python main.py", "python -c 'print(1+1)'")
 - timeout: Max seconds to wait (default: 120)
+- session_id: Optional identifier to isolate this sandbox from other agents.
+  Calls with the same session_id share a container; different IDs get separate containers.
 
 Returns JSON: {command, stdout, stderr, returncode, status, files_created}
 
@@ -550,13 +568,14 @@ Examples:
 def run_code(
     command: str | None = None,
     timeout: int = 120,
+    session_id: str | None = None,
 ) -> str:
     if not command:
         return json.dumps({"status": "error", "error": "No command specified"}, indent=2)
 
     timeout = min(timeout, 600)
-    session_id = _get_session_id()
-    data_path = _get_data_path()
+    session_id = _get_session_id(session_id)
+    data_path = _get_data_path(session_id)
 
     try:
         container_info = _manager.get_or_create_container(session_id, data_path)
@@ -627,14 +646,17 @@ def run_code(
     description="""Check the status of the code execution environment.
 Shows whether the sandbox is running, what packages are installed, and resource usage.
 
+Args:
+- session_id: Optional identifier to check a specific agent's sandbox.
+
 Returns JSON: {status, python_version, installed_packages,
 disk_usage_mb, uptime_seconds, gpu_available}""",
 )
-def sandbox_status() -> str:
+def sandbox_status(session_id: str | None = None) -> str:
     try:
         docker_available = _manager._check_docker()
         gpu_available = _manager._check_gpu() if docker_available else False
-        session_id = _get_session_id()
+        session_id = _get_session_id(session_id)
 
         if not docker_available:
             return json.dumps(
