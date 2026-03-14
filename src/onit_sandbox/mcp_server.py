@@ -22,6 +22,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any, Literal, overload
 
 from onit_sandbox.server import (
     DEFAULT_CPU_QUOTA,
@@ -255,13 +256,36 @@ class SandboxManager:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
 
+    @overload
+    def exec_in_container(
+        self,
+        container_id: str,
+        command: str,
+        timeout: int = ...,
+        workdir: str = ...,
+        env: dict[str, str] | None = ...,
+        *,
+        split_output: Literal[True],
+    ) -> tuple[int, str, str]: ...
+
+    @overload
+    def exec_in_container(
+        self,
+        container_id: str,
+        command: str,
+        timeout: int = ...,
+        workdir: str = ...,
+        env: dict[str, str] | None = ...,
+        split_output: Literal[False] = ...,
+    ) -> tuple[int, str]: ...
+
     def exec_in_container(
         self,
         container_id: str,
         command: str,
         timeout: int = DEFAULT_TIMEOUT,
         workdir: str = "/workspace",
-        env: dict | None = None,
+        env: dict[str, str] | None = None,
         split_output: bool = False,
     ) -> tuple[int, str] | tuple[int, str, str]:
         """Execute a command inside a container.
@@ -350,7 +374,7 @@ class SandboxManager:
             for session_id in list(self._containers.keys()):
                 self.stop_container(session_id)
 
-    def get_container_stats(self, container_id: str) -> dict | None:
+    def get_container_stats(self, container_id: str) -> dict[str, Any] | None:
         """Get resource usage stats for a container."""
         try:
             result = subprocess.run(
@@ -360,7 +384,8 @@ class SandboxManager:
                 timeout=10,
             )
             if result.returncode == 0:
-                return json.loads(result.stdout)
+                stats: dict[str, Any] = json.loads(result.stdout)
+                return stats
         except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
             pass
         return None
@@ -702,7 +727,13 @@ def sandbox_status() -> str:
 # ---------------------------------------------------------------------------
 
 
-def run(transport="sse", host="0.0.0.0", port=18202, path="/sse", options=None):
+def run(
+    transport: str = "sse",
+    host: str = "0.0.0.0",
+    port: int = 18202,
+    path: str = "/sse",
+    options: dict[str, Any] | None = None,
+) -> None:
     """Start the sandbox MCP server.
 
     Args:
