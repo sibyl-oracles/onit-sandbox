@@ -100,10 +100,7 @@ class TestSandboxWithDocker:
 
     def test_run_code_python(self, sandbox_session):
         """Test running Python code in sandbox."""
-        # Write the file inside the container so permissions are correct
-        run_code(command="echo \"print('Python works!')\" > /workspace/test.py")
-
-        result = run_code(command="python test.py")
+        result = run_code(command="python -c \"print('Python works!')\"")
         data = json.loads(result)
 
         assert data["status"] == "ok", f"run_code failed: {data}"
