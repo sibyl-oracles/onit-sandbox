@@ -464,6 +464,7 @@ def _list_workspace_files(container_id: str) -> set[str]:
     description="""Install Python packages in the code execution environment using pip.
 Call this BEFORE running code that requires external libraries.
 Multiple packages can be specified in a single call, separated by spaces.
+Network access is enabled automatically for the duration of the install.
 
 Args:
 - packages: Space-separated package names with optional versions
@@ -555,22 +556,30 @@ Use this to run Python scripts, shell commands, or any program inside the sandbo
 Files written by write_file are available in the working directory.
 Generated output files (plots, CSVs, etc.) will also appear in the working directory.
 
+IMPORTANT — Network access:
+By default the sandbox has NO internet access. If your code needs to
+download datasets, call APIs, or access any remote resource, you MUST
+either set network=True on this call, or call enable_sandbox_network
+first for persistent access across multiple commands.
+
 Args:
-- command: The command to execute (e.g., "python main.py", "python -c 'print(1+1)'")
+- command: The command to execute
+  (e.g., "python main.py", "python -c 'print(1+1)'")
 - timeout: Max seconds to wait (default: 120, max: 3600).
   Configurable via SANDBOX_MAX_TIMEOUT env var.
-- network: If True, temporarily enable network access for this command.
-  For persistent network access across multiple commands, use the enable_network tool instead.
-- session_id: Optional identifier to isolate this sandbox from other agents.
-  Calls with the same session_id share a container; different IDs get separate containers.
+- network: Set to True to temporarily enable internet access for
+  this command. The network is disabled again after the command
+  finishes. For persistent access, use enable_sandbox_network.
+- session_id: Optional identifier to isolate this sandbox from
+  other agents. Same session_id = shared container.
 
-Returns JSON: {command, stdout, stderr, returncode, status, files_created}
+Returns JSON: {command, stdout, stderr, returncode, status,
+files_created}
 
 Examples:
   run_code(command="python main.py")
   run_code(command="python simulate_ekf.py", timeout=300)
-  run_code(command="python -c 'import numpy; print(numpy.__version__)'")
-  run_code(command="python download_data.py", network=True, timeout=300)""",
+  run_code(command="python download_data.py", network=True)""",
 )
 def run_code(
     command: str | None = None,
@@ -764,10 +773,18 @@ def sandbox_status(session_id: str | None = None) -> str:
 
 @mcp.tool(
     title="Enable Network",
-    description="""Enable persistent network access for the sandbox.
-Once enabled, all subsequent run_code and install_packages calls will have
-network access until disable_network is called.
-Useful for long-running experiments that need to download data, call APIs, etc.
+    description="""Enable persistent internet access for the sandbox.
+
+Call this BEFORE starting work that requires sustained network access,
+such as downloading datasets, training with remote logging, calling
+external APIs, or any multi-step workflow that needs the internet.
+
+Once enabled, ALL subsequent run_code and install_packages calls in
+this session will have internet access until you call
+disable_sandbox_network.
+
+Prefer this over setting network=True on every run_code call when
+you have multiple commands that need internet access.
 
 Args:
 - session_id: Optional identifier for the target sandbox.
@@ -803,8 +820,11 @@ def enable_sandbox_network(session_id: str | None = None) -> str:
 
 @mcp.tool(
     title="Disable Network",
-    description="""Disable network access for the sandbox, restoring network isolation.
-Use this after long-running experiments to re-secure the sandbox.
+    description="""Disable internet access for the sandbox, restoring
+network isolation.
+
+Call this when you are done downloading data or accessing remote
+services and want to restore the sandbox's default isolated state.
 
 Args:
 - session_id: Optional identifier for the target sandbox.
