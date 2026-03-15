@@ -557,7 +557,8 @@ Generated output files (plots, CSVs, etc.) will also appear in the working direc
 
 Args:
 - command: The command to execute (e.g., "python main.py", "python -c 'print(1+1)'")
-- timeout: Max seconds to wait (default: 120, max: 3600). Configurable via SANDBOX_MAX_TIMEOUT env var.
+- timeout: Max seconds to wait (default: 120, max: 3600).
+  Configurable via SANDBOX_MAX_TIMEOUT env var.
 - network: If True, temporarily enable network access for this command.
   For persistent network access across multiple commands, use the enable_network tool instead.
 - session_id: Optional identifier to isolate this sandbox from other agents.
