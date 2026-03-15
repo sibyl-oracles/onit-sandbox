@@ -31,6 +31,7 @@ from onit_sandbox.server import (
     DEFAULT_TIMEOUT,
     FALLBACK_IMAGE,
     INSTALL_TIMEOUT,
+    MAX_TIMEOUT,
     SANDBOX_IMAGE,
     SandboxMCPServer,
 )
@@ -48,6 +49,7 @@ class ContainerInfo:
     created_at: datetime
     image: str
     status: str = "created"
+    network_enabled: bool = False
     installed_packages: list = field(default_factory=list)
 
 
@@ -524,7 +526,8 @@ def install_packages(packages: str | None = None, session_id: str | None = None)
                 indent=2,
             )
         finally:
-            _manager.disable_network(container_info.container_id)
+            if not container_info.network_enabled:
+                _manager.disable_network(container_info.container_id)
 
     except DockerNotAvailableError:
         return json.dumps(
@@ -554,7 +557,9 @@ Generated output files (plots, CSVs, etc.) will also appear in the working direc
 
 Args:
 - command: The command to execute (e.g., "python main.py", "python -c 'print(1+1)'")
-- timeout: Max seconds to wait (default: 120)
+- timeout: Max seconds to wait (default: 120, max: 3600). Configurable via SANDBOX_MAX_TIMEOUT env var.
+- network: If True, temporarily enable network access for this command.
+  For persistent network access across multiple commands, use the enable_network tool instead.
 - session_id: Optional identifier to isolate this sandbox from other agents.
   Calls with the same session_id share a container; different IDs get separate containers.
 
@@ -563,55 +568,66 @@ Returns JSON: {command, stdout, stderr, returncode, status, files_created}
 Examples:
   run_code(command="python main.py")
   run_code(command="python simulate_ekf.py", timeout=300)
-  run_code(command="python -c 'import numpy; print(numpy.__version__)'")""",
+  run_code(command="python -c 'import numpy; print(numpy.__version__)'")
+  run_code(command="python download_data.py", network=True, timeout=300)""",
 )
 def run_code(
     command: str | None = None,
     timeout: int = 120,
+    network: bool = False,
     session_id: str | None = None,
 ) -> str:
     if not command:
         return json.dumps({"status": "error", "error": "No command specified"}, indent=2)
 
-    timeout = min(timeout, 600)
+    timeout = min(timeout, MAX_TIMEOUT)
     session_id = _get_session_id(session_id)
     data_path = _get_data_path(session_id)
 
     try:
         container_info = _manager.get_or_create_container(session_id, data_path)
 
-        # Snapshot files before execution
-        files_before = _list_workspace_files(container_info.container_id)
+        # Enable network temporarily if requested (and not already persistent)
+        temp_network = False
+        if network and not container_info.network_enabled:
+            temp_network = _manager.enable_network(container_info.container_id)
 
-        exit_code, stdout, stderr = _manager.exec_in_container(
-            container_info.container_id,
-            command,
-            timeout=timeout,
-            split_output=True,
-        )
+        try:
+            # Snapshot files before execution
+            files_before = _list_workspace_files(container_info.container_id)
 
-        # Detect new files
-        files_after = _list_workspace_files(container_info.container_id)
-        files_created = sorted(files_after - files_before)
+            exit_code, stdout, stderr = _manager.exec_in_container(
+                container_info.container_id,
+                command,
+                timeout=timeout,
+                split_output=True,
+            )
 
-        if exit_code == -1 and "timed out" in stderr:
-            status = "timeout"
-        elif exit_code == 0:
-            status = "ok"
-        else:
-            status = "error"
+            # Detect new files
+            files_after = _list_workspace_files(container_info.container_id)
+            files_created = sorted(files_after - files_before)
 
-        return json.dumps(
-            {
-                "command": command,
-                "stdout": stdout[-10000:],
-                "stderr": stderr[-10000:],
-                "returncode": exit_code,
-                "status": status,
-                "files_created": files_created,
-            },
-            indent=2,
-        )
+            if exit_code == -1 and "timed out" in stderr:
+                status = "timeout"
+            elif exit_code == 0:
+                status = "ok"
+            else:
+                status = "error"
+
+            return json.dumps(
+                {
+                    "command": command,
+                    "stdout": stdout[-10000:],
+                    "stderr": stderr[-10000:],
+                    "returncode": exit_code,
+                    "status": status,
+                    "files_created": files_created,
+                },
+                indent=2,
+            )
+        finally:
+            if temp_network:
+                _manager.disable_network(container_info.container_id)
 
     except DockerNotAvailableError:
         return json.dumps(
@@ -735,12 +751,89 @@ def sandbox_status(session_id: str | None = None) -> str:
                 "disk_usage_mb": disk_usage_mb,
                 "uptime_seconds": round(uptime_seconds),
                 "gpu_available": gpu_available,
+                "network_enabled": info.network_enabled,
             },
             indent=2,
         )
 
     except Exception as e:
         logger.exception("Error in sandbox_status")
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+
+@mcp.tool(
+    title="Enable Network",
+    description="""Enable persistent network access for the sandbox.
+Once enabled, all subsequent run_code and install_packages calls will have
+network access until disable_network is called.
+Useful for long-running experiments that need to download data, call APIs, etc.
+
+Args:
+- session_id: Optional identifier for the target sandbox.
+
+Returns JSON: {status, network_enabled}""",
+)
+def enable_sandbox_network(session_id: str | None = None) -> str:
+    session_id = _get_session_id(session_id)
+    data_path = _get_data_path(session_id)
+
+    try:
+        container_info = _manager.get_or_create_container(session_id, data_path)
+        success = _manager.enable_network(container_info.container_id)
+        if success:
+            container_info.network_enabled = True
+            return json.dumps(
+                {"status": "ok", "network_enabled": True},
+                indent=2,
+            )
+        return json.dumps(
+            {"status": "error", "error": "Failed to enable network access"},
+            indent=2,
+        )
+    except DockerNotAvailableError:
+        return json.dumps(
+            {"status": "error", "error": "Docker is not available"},
+            indent=2,
+        )
+    except Exception as e:
+        logger.exception("Error in enable_sandbox_network")
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+
+@mcp.tool(
+    title="Disable Network",
+    description="""Disable network access for the sandbox, restoring network isolation.
+Use this after long-running experiments to re-secure the sandbox.
+
+Args:
+- session_id: Optional identifier for the target sandbox.
+
+Returns JSON: {status, network_enabled}""",
+)
+def disable_sandbox_network(session_id: str | None = None) -> str:
+    session_id = _get_session_id(session_id)
+    data_path = _get_data_path(session_id)
+
+    try:
+        container_info = _manager.get_or_create_container(session_id, data_path)
+        success = _manager.disable_network(container_info.container_id)
+        if success:
+            container_info.network_enabled = False
+            return json.dumps(
+                {"status": "ok", "network_enabled": False},
+                indent=2,
+            )
+        return json.dumps(
+            {"status": "error", "error": "Failed to disable network access"},
+            indent=2,
+        )
+    except DockerNotAvailableError:
+        return json.dumps(
+            {"status": "error", "error": "Docker is not available"},
+            indent=2,
+        )
+    except Exception as e:
+        logger.exception("Error in disable_sandbox_network")
         return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
 

@@ -13,6 +13,8 @@ import onit_sandbox.mcp_server as mcp_module
 from onit_sandbox.mcp_server import (
     SandboxManager,
     cleanup_sandbox,
+    disable_sandbox_network,
+    enable_sandbox_network,
     install_packages,
     run_code,
     sandbox_status,
@@ -154,6 +156,54 @@ class TestSandboxWithDocker:
 
         assert data["status"] == "timeout"
         assert data["returncode"] == -1
+
+    def test_run_code_with_network(self, sandbox_session):
+        """Test run_code with temporary network access."""
+        result = run_code(
+            command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
+            network=True,
+            timeout=30,
+        )
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert "200" in data["stdout"]
+
+    def test_enable_disable_network(self, sandbox_session):
+        """Test persistent network enable/disable tools."""
+        # Create container first
+        run_code(command="echo hello")
+
+        # Enable persistent network
+        result = enable_sandbox_network()
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert data["network_enabled"] is True
+
+        # Verify network works in run_code without network=True flag
+        # (bridge stays connected since enable_sandbox_network connected it)
+        result = run_code(
+            command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
+            timeout=30,
+        )
+        run_data = json.loads(result)
+        assert run_data["status"] == "ok"
+        assert "200" in run_data["stdout"]
+
+        # Check status reports network_enabled
+        status_result = sandbox_status()
+        status_data = json.loads(status_result)
+        assert status_data["network_enabled"] is True
+
+        # Disable network
+        result = disable_sandbox_network()
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert data["network_enabled"] is False
+
+        # Verify status updated
+        status_result = sandbox_status()
+        status_data = json.loads(status_result)
+        assert status_data["network_enabled"] is False
 
 
 if __name__ == "__main__":
