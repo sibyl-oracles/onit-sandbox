@@ -14,17 +14,20 @@ Tools:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import functools
 import json
 import logging
 import os
+import signal
 import subprocess
 import tempfile
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Literal, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 from mcp.server.fastmcp import Context
 
@@ -186,7 +189,7 @@ class SandboxManager:
             "--dns",
             "8.8.4.4",
             "--user",
-            "1000:1000",
+            f"{os.getuid()}:{os.getgid()}",
             "-e",
             "HOME=/home/sandbox",
             "-e",
@@ -216,7 +219,7 @@ class SandboxManager:
                     "sh",
                     "-c",
                     "mkdir -p /home/sandbox/.cache/pip /home/sandbox/.local"
-                    " && chown -R 1000:1000 /home/sandbox",
+                    f" && chown -R {os.getuid()}:{os.getgid()} /home/sandbox",
                 ],
                 capture_output=True,
                 timeout=10,
@@ -382,8 +385,10 @@ class SandboxManager:
     def cleanup_all(self) -> None:
         """Stop all managed containers."""
         with self._lock:
-            for session_id in list(self._containers.keys()):
-                self.stop_container(session_id)
+            session_ids = list(self._containers.keys())
+
+        for session_id in session_ids:
+            self.stop_container(session_id)
 
     def get_container_stats(self, container_id: str) -> dict[str, Any] | None:
         """Get resource usage stats for a container."""
@@ -510,7 +515,8 @@ async def _run_with_progress(
 
 @mcp.tool(
     title="Install Python Packages",
-    description="""Install Python packages in the code execution environment using pip.
+    description="""Install Python packages inside the isolated Docker sandbox using pip.
+Packages are installed in the sandbox container, NOT on your local system.
 Call this BEFORE running code that requires external libraries.
 Multiple packages can be specified in a single call, separated by spaces.
 Network access is enabled automatically for the duration of the install.
@@ -607,10 +613,17 @@ async def install_packages(
 
 @mcp.tool(
     title="Run Code",
-    description="""Execute a command in the code execution environment.
-Use this to run Python scripts, shell commands, or any program inside the sandbox.
-Files written by write_file are available in the working directory.
-Generated output files (plots, CSVs, etc.) will also appear in the working directory.
+    description="""Execute a command inside an isolated Docker sandbox container.
+
+CRITICAL — Sandbox isolation:
+The sandbox is a SEPARATE Docker container with its OWN filesystem.
+It is NOT your local filesystem. You CANNOT directly access files
+from your local machine or working directory inside the sandbox.
+To make code available in the sandbox, you must first write it there
+using write_file, or pass it inline via "python -c '...'".
+Similarly, files created inside the sandbox (plots, CSVs, etc.)
+exist only in the sandbox's /workspace directory — they are NOT
+automatically available on your local filesystem.
 
 IMPORTANT — Network access:
 By default the sandbox has NO internet access. If your code needs to
@@ -619,7 +632,7 @@ either set network=True on this call, or call enable_sandbox_network
 first for persistent access across multiple commands.
 
 Args:
-- command: The command to execute
+- command: The command to execute inside the sandbox
   (e.g., "python main.py", "python -c 'print(1+1)'")
 - timeout: Max seconds to wait (default: 120, max: 3600).
   Configurable via SANDBOX_MAX_TIMEOUT env var.
@@ -730,8 +743,9 @@ async def run_code(
 
 @mcp.tool(
     title="Sandbox Status",
-    description="""Check the status of the code execution environment.
+    description="""Check the status of the isolated Docker sandbox container.
 Shows whether the sandbox is running, what packages are installed, and resource usage.
+This reports on the sandbox environment, which is separate from your local system.
 
 Args:
 - session_id: Optional identifier to check a specific agent's sandbox.
@@ -975,6 +989,17 @@ def run(
     _server.port = port
     _server.path = path
     _server.transport = transport
+
+    # Register cleanup handlers so containers are stopped on exit (including Ctrl+C)
+    atexit.register(cleanup_all_sandboxes)
+
+    def _shutdown_handler(signum: int, frame: Any) -> None:
+        logger.info("Received signal %s, cleaning up containers...", signum)
+        cleanup_all_sandboxes()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
 
     logger.info(
         "Starting Sandbox MCP Server on http://%s:%s%s (transport: %s)",

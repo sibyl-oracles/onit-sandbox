@@ -152,7 +152,7 @@ class TestSandboxWithDocker:
         assert data["status"] == "running"
         assert data["python_version"] is not None
         assert isinstance(data["installed_packages"], list)
-        assert isinstance(data["disk_usage_mb"], (int, float))
+        assert isinstance(data["disk_usage_mb"], int | float)
         assert isinstance(data["uptime_seconds"], int)
 
     def test_run_code_timeout(self, sandbox_session):

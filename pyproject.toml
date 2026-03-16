@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "onit-sandbox"
-version = "0.1.0"
+version = "0.1.2a"
 description = "A Docker-based code execution sandbox MCP server for safe Python execution"
 readme = "README.md"
 license = "Apache-2.0"
