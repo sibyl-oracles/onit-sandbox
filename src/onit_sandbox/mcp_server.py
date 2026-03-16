@@ -376,7 +376,9 @@ class SandboxManager:
             finally:
                 output_queue.put((label, ""))  # sentinel
 
-        def _cleanup_proc(proc: subprocess.Popen[str], t_out: threading.Thread, t_err: threading.Thread) -> None:
+        def _cleanup_proc(
+            proc: subprocess.Popen[str], t_out: threading.Thread, t_err: threading.Thread
+        ) -> None:
             """Kill process, close pipes, and join reader threads."""
             proc.kill()
             proc.wait()
@@ -1138,13 +1140,9 @@ async def download_file(
     ctx: Context | None = None,
 ) -> str:
     if not sandbox_path:
-        return json.dumps(
-            {"status": "error", "error": "No sandbox_path specified"}, indent=2
-        )
+        return json.dumps({"status": "error", "error": "No sandbox_path specified"}, indent=2)
     if not dest_path:
-        return json.dumps(
-            {"status": "error", "error": "No dest_path specified"}, indent=2
-        )
+        return json.dumps({"status": "error", "error": "No dest_path specified"}, indent=2)
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
