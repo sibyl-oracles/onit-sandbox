@@ -564,9 +564,7 @@ async def install_packages(
                     # Parse successfully installed packages from pip output
                     for line in output.split("\n"):
                         if line.strip().startswith("Successfully installed"):
-                            installed = [
-                                pkg.rsplit("-", 1)[0] for pkg in line.strip().split()[2:]
-                            ]
+                            installed = [pkg.rsplit("-", 1)[0] for pkg in line.strip().split()[2:]]
                             break
                     if not installed:
                         # Fallback: assume requested packages were installed

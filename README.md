@@ -45,6 +45,23 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 
 - **Python 3.10+**
 - **Docker** — install from [docker.com](https://docs.docker.com/get-docker/) and make sure the daemon is running (`docker info`)
+- **NVIDIA Container Toolkit** *(optional, for GPU support)* — required to pass GPUs into containers. Without it, `gpu_available` will be `false` even if the host has a GPU. Install with:
+
+  ```bash
+  # Add the NVIDIA container toolkit repo
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+    sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+  # Install and configure
+  sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
+  ```
+
+  Verify with: `docker info -f '{{json .Runtimes}}'` — the output should contain `"nvidia"`.
 
 ### Step 1 — Install the Python package
 
@@ -293,6 +310,7 @@ mypy src/                # Type check
 | Permission denied on workspace | `chmod -R 777 /path/to/workspace` |
 | Command timeout | Increase timeout: `run_code(command="...", timeout=300)` |
 | Port already in use | Use `--port` flag: `onit-sandbox start --port 18206` |
+| `gpu_available` is false despite having a GPU | Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) — Docker needs it to expose GPUs to containers. See Prerequisites above. |
 
 ## License
 
