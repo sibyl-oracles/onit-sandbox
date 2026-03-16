@@ -15,6 +15,7 @@ from onit_sandbox.mcp_server import (
     SandboxManager,
     cleanup_sandbox,
     disable_sandbox_network,
+    download_file,
     enable_sandbox_network,
     install_packages,
     run_code,
@@ -85,6 +86,18 @@ class TestSandboxTools:
     def test_run_code_no_command(self):
         """Test run_code with no command specified."""
         result = _run(run_code(command=None))
+        data = json.loads(result)
+        assert data["status"] == "error"
+
+    def test_download_file_no_sandbox_path(self):
+        """Test download_file with no sandbox_path specified."""
+        result = _run(download_file(sandbox_path=None, dest_path="/tmp/out.txt"))
+        data = json.loads(result)
+        assert data["status"] == "error"
+
+    def test_download_file_no_dest_path(self):
+        """Test download_file with no dest_path specified."""
+        result = _run(download_file(sandbox_path="file.txt", dest_path=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
@@ -175,6 +188,39 @@ class TestSandboxWithDocker:
         data = json.loads(result)
         assert data["status"] == "ok"
         assert "200" in data["stdout"]
+
+    def test_download_file(self, sandbox_session):
+        """Test copying a file from the sandbox to the local filesystem."""
+        session_id, tmp_path = sandbox_session
+
+        # Create a file inside the sandbox
+        _run(run_code(command="echo 'download test' > /workspace/dl_test.txt"))
+
+        # Download it to a local path
+        dest = str(tmp_path / "downloaded.txt")
+        result = _run(download_file(sandbox_path="dl_test.txt", dest_path=dest))
+        data = json.loads(result)
+
+        assert data["status"] == "ok"
+        assert data["sandbox_path"] == "dl_test.txt"
+        assert data["dest_path"] == dest
+        assert os.path.isfile(dest)
+        with open(dest) as f:
+            assert "download test" in f.read()
+
+    def test_download_file_not_found(self, sandbox_session):
+        """Test downloading a nonexistent file from the sandbox."""
+        session_id, tmp_path = sandbox_session
+
+        # Ensure sandbox is running
+        _run(run_code(command="echo hello"))
+
+        dest = str(tmp_path / "missing.txt")
+        result = _run(download_file(sandbox_path="no_such_file.txt", dest_path=dest))
+        data = json.loads(result)
+
+        assert data["status"] == "error"
+        assert "not find" in data["error"].lower() or "not found" in data["error"].lower()
 
     def test_enable_disable_network(self, sandbox_session):
         """Test persistent network enable/disable tools."""

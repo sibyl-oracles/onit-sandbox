@@ -9,6 +9,7 @@ Tools:
 - install_packages: Install Python packages in the sandbox
 - run_code: Execute commands in the isolated sandbox
 - sandbox_status: Inspect sandbox state, packages, and resource usage
+- download_file: Copy a file from the sandbox to the local filesystem
 """
 
 from __future__ import annotations
@@ -19,10 +20,12 @@ import functools
 import json
 import logging
 import os
+import queue
 import signal
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -293,6 +296,21 @@ class SandboxManager:
         split_output: Literal[False] = ...,
     ) -> tuple[int, str]: ...
 
+    @staticmethod
+    def _build_exec_cmd(
+        container_id: str,
+        command: str,
+        workdir: str = "/workspace",
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        """Build a ``docker exec`` command list."""
+        cmd = ["docker", "exec", "-w", workdir]
+        if env:
+            for key, value in env.items():
+                cmd.extend(["-e", f"{key}={value}"])
+        cmd.extend([container_id, "sh", "-c", command])
+        return cmd
+
     def exec_in_container(
         self,
         container_id: str,
@@ -307,13 +325,7 @@ class SandboxManager:
         When split_output is True, returns (returncode, stdout, stderr).
         Otherwise returns (returncode, combined_output) for backward compat.
         """
-        cmd = ["docker", "exec", "-w", workdir]
-
-        if env:
-            for key, value in env.items():
-                cmd.extend(["-e", f"{key}={value}"])
-
-        cmd.extend([container_id, "sh", "-c", command])
+        cmd = self._build_exec_cmd(container_id, command, workdir, env)
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -325,6 +337,107 @@ class SandboxManager:
             if split_output:
                 return -1, "", f"Command timed out after {timeout} seconds"
             return -1, f"Command timed out after {timeout} seconds"
+
+    def exec_in_container_streaming(
+        self,
+        container_id: str,
+        command: str,
+        timeout: int = DEFAULT_TIMEOUT,
+        workdir: str = "/workspace",
+        env: dict[str, str] | None = None,
+        on_output: Callable[[str], None] | None = None,
+    ) -> tuple[int, str, str]:
+        """Execute a command inside a container, streaming output line-by-line.
+
+        Calls *on_output* with each line of merged stdout/stderr as it arrives.
+        Returns (returncode, stdout, stderr) like the split_output variant.
+
+        Environment is extended with PYTHONUNBUFFERED=1 and TERM=dumb so that
+        Python flushes immediately and tqdm falls back to newline-based output
+        instead of ``\\r`` overwrites.
+        """
+        if env is None:
+            env = {}
+        # Force unbuffered Python and dumb terminal for readable progress bars
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("TERM", "dumb")
+
+        cmd = self._build_exec_cmd(container_id, command, workdir, env)
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+
+        def _reader(stream: Any, label: str) -> None:
+            """Read lines from a stream and put them on the queue."""
+            try:
+                for raw_line in stream:
+                    output_queue.put((label, raw_line))
+            finally:
+                output_queue.put((label, ""))  # sentinel
+
+        def _cleanup_proc(proc: subprocess.Popen[str], t_out: threading.Thread, t_err: threading.Thread) -> None:
+            """Kill process, close pipes, and join reader threads."""
+            proc.kill()
+            proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # Read stdout and stderr in parallel threads
+            t_out = threading.Thread(target=_reader, args=(proc.stdout, "stdout"), daemon=True)
+            t_err = threading.Thread(target=_reader, args=(proc.stderr, "stderr"), daemon=True)
+            t_out.start()
+            t_err.start()
+
+            deadline = time.monotonic() + timeout
+            sentinels_received = 0
+
+            while sentinels_received < 2:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _cleanup_proc(proc, t_out, t_err)
+                    return -1, "".join(stdout_lines), f"Command timed out after {timeout} seconds"
+
+                try:
+                    label, line = output_queue.get(timeout=min(remaining, 1.0))
+                except queue.Empty:
+                    continue
+
+                if line == "":
+                    sentinels_received += 1
+                    continue
+
+                if label == "stdout":
+                    stdout_lines.append(line)
+                else:
+                    stderr_lines.append(line)
+
+                if on_output is not None:
+                    on_output(line.rstrip("\n"))
+
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _cleanup_proc(proc, t_out, t_err)
+
+            return proc.returncode, "".join(stdout_lines), "".join(stderr_lines)
+
+        except FileNotFoundError:
+            return -1, "", "docker command not found"
 
     def enable_network(self, container_id: str) -> bool:
         """Temporarily enable network for the container.
@@ -490,7 +603,7 @@ async def _run_with_progress(
     When *ctx* is ``None`` (e.g. direct calls from tests) the function is
     still offloaded to a thread but no heartbeats are emitted.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     future = loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
     if ctx is None:
@@ -662,6 +775,13 @@ async def run_code(
 
     clamped_timeout = min(timeout, MAX_TIMEOUT)
 
+    # Queue for streaming output lines from the worker thread to the async loop.
+    line_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _on_output(line: str) -> None:
+        """Callback invoked in the worker thread for each output line."""
+        line_queue.put(line)
+
     def _impl() -> str:
         sid = _get_session_id(session_id)
         data_path = _get_data_path(sid)
@@ -678,11 +798,11 @@ async def run_code(
                 # Snapshot files before execution
                 files_before = _list_workspace_files(container_info.container_id)
 
-                exit_code, stdout, stderr = _manager.exec_in_container(
+                exit_code, stdout, stderr = _manager.exec_in_container_streaming(
                     container_info.container_id,
                     command,
                     timeout=clamped_timeout,
-                    split_output=True,
+                    on_output=_on_output,
                 )
 
                 # Detect new files
@@ -737,8 +857,41 @@ async def run_code(
                 },
                 indent=2,
             )
+        finally:
+            # Signal the async drainer that the worker is done.
+            line_queue.put(None)
 
-    return await _run_with_progress(ctx, _impl)
+    # Run _impl in a thread while draining the line queue and forwarding
+    # each line to the MCP client via ctx.info().
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, _impl)
+
+    if ctx is None:
+        # No MCP context (tests / direct calls) — just await the result.
+        return await future
+
+    async def _drain_queue() -> None:
+        """Forward all queued output lines to the MCP client."""
+        while True:
+            try:
+                line = line_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is not None:
+                await ctx.info(line)
+
+    heartbeat = 0
+    while True:
+        done, _ = await asyncio.wait({future}, timeout=0.25)
+        await _drain_queue()
+
+        if done:
+            await _drain_queue()
+            await ctx.report_progress(progress=1, total=1)
+            return future.result()
+
+        heartbeat += 1
+        await ctx.report_progress(progress=heartbeat, total=heartbeat + 1)
 
 
 @mcp.tool(
@@ -947,6 +1100,137 @@ async def disable_sandbox_network(
         except Exception as e:
             logger.exception("Error in disable_sandbox_network")
             return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Download File from Sandbox",
+    description="""Copy a file from the sandbox container to the local (agent) filesystem.
+
+Use this to retrieve files created by sandbox code — plots, CSVs, model
+checkpoints, logs, etc. — so they are available on your local filesystem
+for inspection, further processing, or delivery to the user.
+
+The sandbox's /workspace is an isolated Docker filesystem. Files there
+are NOT directly accessible from your local tools. This tool bridges
+that gap by copying files out of the container.
+
+Args:
+- sandbox_path: Path of the file inside the sandbox to copy.
+  Can be relative to /workspace (e.g., "output/plot.png") or
+  absolute (e.g., "/workspace/output/plot.png").
+- dest_path: Absolute path on the local filesystem where the file
+  should be written (e.g., "/home/user/results/plot.png").
+  Parent directories are created automatically.
+- session_id: Optional identifier for the target sandbox.
+
+Returns JSON: {status, sandbox_path, dest_path, size_bytes}
+
+Examples:
+  download_file(sandbox_path="results/plot.png", dest_path="/home/user/plot.png")
+  download_file(sandbox_path="model.pt", dest_path="/tmp/model.pt")""",
+)
+async def download_file(
+    sandbox_path: str | None = None,
+    dest_path: str | None = None,
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    if not sandbox_path:
+        return json.dumps(
+            {"status": "error", "error": "No sandbox_path specified"}, indent=2
+        )
+    if not dest_path:
+        return json.dumps(
+            {"status": "error", "error": "No dest_path specified"}, indent=2
+        )
+
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
+
+        try:
+            container_info = _manager.get_or_create_container(sid, data_path)
+
+            # Normalise sandbox_path to absolute
+            if not sandbox_path.startswith("/"):
+                container_path = f"/workspace/{sandbox_path}"
+            else:
+                container_path = sandbox_path
+
+            # Ensure destination directory exists on the host
+            os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+
+            # Use docker cp to copy the file out (fails with clear error if missing)
+            result = subprocess.run(
+                [
+                    "docker",
+                    "cp",
+                    f"{container_info.container_id}:{container_path}",
+                    dest_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": f"docker cp failed: {result.stderr.strip()}",
+                        "sandbox_path": sandbox_path,
+                        "dest_path": dest_path,
+                    },
+                    indent=2,
+                )
+
+            try:
+                size_bytes = os.path.getsize(dest_path)
+            except OSError:
+                size_bytes = None
+
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "sandbox_path": sandbox_path,
+                    "dest_path": dest_path,
+                    "size_bytes": size_bytes,
+                },
+                indent=2,
+            )
+
+        except DockerNotAvailableError:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Docker is not available.",
+                    "sandbox_path": sandbox_path,
+                    "dest_path": dest_path,
+                },
+                indent=2,
+            )
+        except subprocess.TimeoutExpired:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Timed out copying file from sandbox.",
+                    "sandbox_path": sandbox_path,
+                    "dest_path": dest_path,
+                },
+                indent=2,
+            )
+        except Exception as e:
+            logger.exception("Error in download_file")
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "sandbox_path": sandbox_path,
+                    "dest_path": dest_path,
+                },
+                indent=2,
+            )
 
     return await _run_with_progress(ctx, _impl)
 

@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from onit_sandbox.server import DEFAULT_HOST, DEFAULT_PORT
+from onit_sandbox.server import DEFAULT_HOST, DEFAULT_PORT, build_server_url
 
 # State directory — mirrors ~/.onit-workspace/ convention
 STATE_DIR = Path.home() / ".onit-sandbox"
@@ -122,7 +122,7 @@ def _run_background(args: argparse.Namespace) -> None:
 
     if process.poll() is None:
         _write_pid(process.pid)
-        url = f"http://{args.host}:{args.port}/sse"
+        url = build_server_url(args.host, args.port, args.transport)
         print(f"Sandbox MCP Server started on {url} (PID: {process.pid})")
         print(f"Logs: {LOG_FILE}")
     else:
@@ -190,7 +190,10 @@ def build_parser() -> argparse.ArgumentParser:
     start_p.add_argument("--host", default=DEFAULT_HOST, help="Host to bind to")
     start_p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind to")
     start_p.add_argument(
-        "--transport", default="sse", choices=["sse", "stdio"], help="Transport type"
+        "--transport",
+        default="streamable-http",
+        choices=["streamable-http", "sse", "stdio"],
+        help="Transport type",
     )
     start_p.add_argument(
         "--foreground", "-f", action="store_true", help="Run in foreground (don't daemonize)"

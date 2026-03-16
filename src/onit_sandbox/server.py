@@ -33,6 +33,13 @@ MAX_TIMEOUT = int(os.getenv("SANDBOX_MAX_TIMEOUT", "3600"))  # 1 hour
 INSTALL_TIMEOUT = int(os.getenv("SANDBOX_INSTALL_TIMEOUT", "300"))
 
 
+def build_server_url(host: str, port: int, transport: str, path: str = DEFAULT_PATH) -> str:
+    """Build the full server endpoint URL for a given transport."""
+    if transport == "streamable-http":
+        return f"http://{host}:{port}/mcp"
+    return f"http://{host}:{port}{path}"
+
+
 @dataclass
 class SandboxMCPServer:
     """
@@ -45,7 +52,7 @@ class SandboxMCPServer:
     port: int = DEFAULT_PORT
     path: str = DEFAULT_PATH
     data_path: str = DEFAULT_DATA_PATH
-    transport: str = "sse"
+    transport: str = "streamable-http"
     verbose: bool = False
 
     _mcp: FastMCP | None = field(default=None, init=False, repr=False)
@@ -63,8 +70,8 @@ class SandboxMCPServer:
 
     @property
     def url(self) -> str:
-        """Full SSE endpoint URL."""
-        return f"http://{self.host}:{self.port}{self.path}"
+        """Full endpoint URL."""
+        return build_server_url(self.host, self.port, self.transport, self.path)
 
     def run(self) -> None:
         """Start the MCP server (blocking)."""
@@ -81,5 +88,7 @@ class SandboxMCPServer:
 
         if self.transport == "stdio":
             self.mcp.run(transport="stdio")
+        elif self.transport == "streamable-http":
+            self.mcp.run(transport="streamable-http")
         else:
             self.mcp.run(transport="sse")
