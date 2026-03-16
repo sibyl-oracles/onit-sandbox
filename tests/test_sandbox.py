@@ -4,6 +4,7 @@ Tests for the Sandbox MCP Server
 These tests verify the sandbox functionality with and without Docker.
 """
 
+import asyncio
 import json
 import os
 
@@ -19,6 +20,11 @@ from onit_sandbox.mcp_server import (
     run_code,
     sandbox_status,
 )
+
+
+def _run(coro):
+    """Helper to run an async tool function from sync test code."""
+    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 @pytest.fixture
@@ -64,7 +70,7 @@ class TestSandboxTools:
         """Test sandbox_status when no container exists."""
         mcp_module.SESSION_ID = "nonexistent-session-id"
         try:
-            result = sandbox_status()
+            result = _run(sandbox_status())
             data = json.loads(result)
             assert data["status"] in ("not_created", "error")
         finally:
@@ -72,13 +78,13 @@ class TestSandboxTools:
 
     def test_install_packages_no_packages(self):
         """Test install_packages with no packages specified."""
-        result = install_packages(packages=None)
+        result = _run(install_packages(packages=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
     def test_run_code_no_command(self):
         """Test run_code with no command specified."""
-        result = run_code(command=None)
+        result = _run(run_code(command=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
@@ -92,7 +98,7 @@ class TestSandboxWithDocker:
 
     def test_run_code_simple_command(self, sandbox_session):
         """Test running a simple command in sandbox."""
-        result = run_code(command="echo 'Hello, World!'")
+        result = _run(run_code(command="echo 'Hello, World!'"))
         data = json.loads(result)
 
         assert data["status"] == "ok"
@@ -102,7 +108,7 @@ class TestSandboxWithDocker:
 
     def test_run_code_python(self, sandbox_session):
         """Test running Python code in sandbox."""
-        result = run_code(command="python -c \"print('Python works!')\"")
+        result = _run(run_code(command="python -c \"print('Python works!')\""))
         data = json.loads(result)
 
         assert data["status"] == "ok", f"run_code failed: {data}"
@@ -111,7 +117,7 @@ class TestSandboxWithDocker:
     def test_install_packages_and_run(self, sandbox_session):
         """Test installing a package and using it."""
         # Install a small package
-        install_result = install_packages(packages="cowsay")
+        install_result = _run(install_packages(packages="cowsay"))
         install_data = json.loads(install_result)
 
         assert install_data["status"] == "ok"
@@ -119,16 +125,16 @@ class TestSandboxWithDocker:
         assert len(install_data["installed"]) > 0
 
         # Run Python with the package
-        run_result = run_code(
-            command="python -c 'import cowsay; cowsay.cow(\"moo\")'",
+        run_result = _run(
+            run_code(command="python -c 'import cowsay; cowsay.cow(\"moo\")'"),
         )
         run_data = json.loads(run_result)
         assert run_data["status"] == "ok"
 
     def test_files_created_detection(self, sandbox_session):
         """Test that files_created detects new files after execution."""
-        result = run_code(
-            command="echo 'test content' > /workspace/testfile.txt",
+        result = _run(
+            run_code(command="echo 'test content' > /workspace/testfile.txt"),
         )
         data = json.loads(result)
 
@@ -138,9 +144,9 @@ class TestSandboxWithDocker:
     def test_sandbox_status_running(self, sandbox_session):
         """Test sandbox_status when container is running."""
         # First, create a container by running a command
-        run_code(command="echo hello")
+        _run(run_code(command="echo hello"))
 
-        result = sandbox_status()
+        result = _run(sandbox_status())
         data = json.loads(result)
 
         assert data["status"] == "running"
@@ -151,7 +157,7 @@ class TestSandboxWithDocker:
 
     def test_run_code_timeout(self, sandbox_session):
         """Test that run_code respects timeout."""
-        result = run_code(command="sleep 10", timeout=2)
+        result = _run(run_code(command="sleep 10", timeout=2))
         data = json.loads(result)
 
         assert data["status"] == "timeout"
@@ -159,10 +165,12 @@ class TestSandboxWithDocker:
 
     def test_run_code_with_network(self, sandbox_session):
         """Test run_code with temporary network access."""
-        result = run_code(
-            command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
-            network=True,
-            timeout=30,
+        result = _run(
+            run_code(
+                command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
+                network=True,
+                timeout=30,
+            ),
         )
         data = json.loads(result)
         assert data["status"] == "ok"
@@ -171,37 +179,39 @@ class TestSandboxWithDocker:
     def test_enable_disable_network(self, sandbox_session):
         """Test persistent network enable/disable tools."""
         # Create container first
-        run_code(command="echo hello")
+        _run(run_code(command="echo hello"))
 
         # Enable persistent network
-        result = enable_sandbox_network()
+        result = _run(enable_sandbox_network())
         data = json.loads(result)
         assert data["status"] == "ok"
         assert data["network_enabled"] is True
 
         # Verify network works in run_code without network=True flag
         # (bridge stays connected since enable_sandbox_network connected it)
-        result = run_code(
-            command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
-            timeout=30,
+        result = _run(
+            run_code(
+                command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
+                timeout=30,
+            ),
         )
         run_data = json.loads(result)
         assert run_data["status"] == "ok"
         assert "200" in run_data["stdout"]
 
         # Check status reports network_enabled
-        status_result = sandbox_status()
+        status_result = _run(sandbox_status())
         status_data = json.loads(status_result)
         assert status_data["network_enabled"] is True
 
         # Disable network
-        result = disable_sandbox_network()
+        result = _run(disable_sandbox_network())
         data = json.loads(result)
         assert data["status"] == "ok"
         assert data["network_enabled"] is False
 
         # Verify status updated
-        status_result = sandbox_status()
+        status_result = _run(sandbox_status())
         status_data = json.loads(status_result)
         assert status_data["network_enabled"] is False
 

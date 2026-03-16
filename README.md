@@ -29,64 +29,61 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 │             │ Docker CLI              │
 │  ┌──────────▼─────────────────────┐  │
 │  │ Docker Container (per-session) │  │
-│  │  - python:3.12-slim base       │  │
+│  │  - PyTorch + scientific stack  │  │
 │  │  - Full pip access             │  │
 │  │  - Workspace bind-mounted      │  │
+│  │  - Shared pip cache volume     │  │
 │  │  - CPU/mem/network limits      │  │
 │  │  - Auto-cleanup on stop        │  │
 │  └────────────────────────────────┘  │
 └──────────────────────────────────────┘
 ```
 
-## Installation
+## Getting Started
 
-### From PyPI
+### Prerequisites
+
+- **Python 3.10+**
+- **Docker** — install from [docker.com](https://docs.docker.com/get-docker/) and make sure the daemon is running (`docker info`)
+
+### Step 1 — Install the Python package
 
 ```bash
+# From PyPI
 pip install onit-sandbox
-```
 
-### From source
-
-```bash
+# Or from source
 git clone https://github.com/sibyl-oracles/onit-sandbox.git
 cd onit-sandbox
 pip install -e .
 ```
 
-### Prerequisites
+### Step 2 — Build (or pull) the Docker image
 
-- **Python 3.10+**
-- **Docker** — install from [docker.com](https://docs.docker.com/get-docker/)
+The sandbox image comes pre-loaded with PyTorch (CUDA), torchvision, torchaudio, and the common scientific Python stack so agents can `import torch` without waiting for a pip install.
 
-## Docker Image
-
-The sandbox runs code inside a custom Docker image pre-loaded with common scientific packages.
-
-### Pull from GitHub Container Registry
+**Option A — Pull from GHCR:**
 
 ```bash
 docker pull ghcr.io/sibyl-oracles/onit-sandbox:latest
-```
-
-Then set the image name so the server uses it:
-
-```bash
 export SANDBOX_IMAGE=ghcr.io/sibyl-oracles/onit-sandbox:latest
 ```
 
-### Build locally
+**Option B — Build locally:**
 
 ```bash
 cd docker
 chmod +x build.sh
-./build.sh
+./build.sh        # builds onit-sandbox:latest
 ```
 
-This builds `onit-sandbox:latest` locally. The image includes:
+Pre-installed packages:
 
 | Package | Description |
 |---------|-------------|
+| torch | Deep learning (CUDA) |
+| torchvision | Vision models and transforms |
+| torchaudio | Audio processing |
 | numpy | Numerical computing |
 | matplotlib | Plotting and visualization |
 | scipy | Scientific computing |
@@ -95,11 +92,9 @@ This builds `onit-sandbox:latest` locally. The image includes:
 | sympy | Symbolic mathematics |
 | pytest | Testing framework |
 
-### Fallback
+> **Fallback:** If no custom image is found, the server falls back to `python:3.12-slim` automatically. Packages can still be installed at runtime via `install_packages`.
 
-If no custom image is found, the server falls back to `python:3.12-slim` automatically. Packages can still be installed at runtime via `install_packages`.
-
-## Quick Start
+### Step 3 — Start the server
 
 ```bash
 # Start the MCP server (background)
@@ -173,11 +168,12 @@ onit-sandbox start [OPTIONS]
 |----------|---------|-------------|
 | `SANDBOX_IMAGE` | `onit-sandbox:latest` | Docker image to use |
 | `FALLBACK_IMAGE` | `python:3.12-slim` | Fallback if sandbox image unavailable |
-| `SANDBOX_MEMORY_LIMIT` | `512m` | Container memory limit |
+| `SANDBOX_MEMORY_LIMIT` | `2g` | Container memory limit |
 | `SANDBOX_CPU_QUOTA` | `100000` | CPU quota (100000 = 1 CPU) |
 | `SANDBOX_PIDS_LIMIT` | `100` | Max processes in container |
 | `SANDBOX_DEFAULT_TIMEOUT` | `60` | Default command timeout (seconds) |
 | `SANDBOX_INSTALL_TIMEOUT` | `300` | Package install timeout (seconds) |
+| `SANDBOX_PIP_CACHE_PATH` | `/tmp/onit/pip-cache` | Shared pip cache across sessions |
 
 ### YAML Configuration
 
@@ -191,7 +187,7 @@ server:
 
 docker:
   sandbox_image: onit-sandbox:latest
-  memory_limit: 512m
+  memory_limit: 2g
   cpu_quota: 100000
   pids_limit: 100
   network_disabled_default: true
@@ -229,7 +225,7 @@ cleanup_sandbox(session_id="my-session")
 |-------|-----------|
 | Filesystem | Container isolation — only mounted workspace is accessible |
 | User | Non-root execution as `sandbox` (UID 1000) |
-| Resources | Memory (512 MB), CPU (1 core), PIDs (100) |
+| Resources | Memory (2 GB), CPU (1 core), PIDs (100) |
 | Network | Disabled by default — enabled only during `install_packages` |
 | Lifecycle | Containers auto-removed on stop (`--rm` flag) |
 | GPU | Optional NVIDIA GPU passthrough when available |

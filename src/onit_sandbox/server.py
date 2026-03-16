@@ -20,11 +20,12 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 18205
 DEFAULT_PATH = "/sse"
 DEFAULT_DATA_PATH = "/tmp/onit/data"
+DEFAULT_PIP_CACHE_PATH = os.getenv("SANDBOX_PIP_CACHE_PATH", "/tmp/onit/pip-cache")
 
 # Docker configuration constants
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "onit-sandbox:latest")
 FALLBACK_IMAGE = os.getenv("FALLBACK_IMAGE", "python:3.12-slim")
-DEFAULT_MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "512m")
+DEFAULT_MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "2g")
 DEFAULT_CPU_QUOTA = int(os.getenv("SANDBOX_CPU_QUOTA", "100000"))  # 1 CPU
 DEFAULT_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "100"))
 DEFAULT_TIMEOUT = int(os.getenv("SANDBOX_DEFAULT_TIMEOUT", "60"))

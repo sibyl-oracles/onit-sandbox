@@ -8,6 +8,13 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 # Create non-root user for security
 RUN useradd -m -u 1000 sandbox
 
+# Install PyTorch ecosystem (CUDA) — largest packages first to maximise
+# layer-cache hits when the smaller scientific stack changes.
+RUN pip install --no-cache-dir \
+    torch \
+    torchvision \
+    torchaudio
+
 # Install common scientific packages in system Python
 RUN pip install --no-cache-dir \
     numpy \

@@ -13,6 +13,8 @@ Tools:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import os
@@ -22,12 +24,15 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, overload
+from typing import Any, Callable, Literal, TypeVar, overload
+
+from mcp.server.fastmcp import Context
 
 from onit_sandbox.server import (
     DEFAULT_CPU_QUOTA,
     DEFAULT_MEMORY_LIMIT,
     DEFAULT_PIDS_LIMIT,
+    DEFAULT_PIP_CACHE_PATH,
     DEFAULT_TIMEOUT,
     FALLBACK_IMAGE,
     INSTALL_TIMEOUT,
@@ -148,6 +153,8 @@ class SandboxManager:
 
         container_name = self._get_container_name(session_id)
         os.makedirs(data_path, exist_ok=True)
+        pip_cache = os.path.abspath(DEFAULT_PIP_CACHE_PATH)
+        os.makedirs(pip_cache, exist_ok=True)
 
         # Start on bridge so the network stack is fully initialized (DNS,
         # routing tables, etc.), then immediately disconnect.  This lets
@@ -164,6 +171,8 @@ class SandboxManager:
             container_name,
             "--volume",
             f"{os.path.abspath(data_path)}:/workspace:rw",
+            "--volume",
+            f"{pip_cache}:/home/sandbox/.cache/pip:rw",
             "--workdir",
             "/workspace",
             "--memory",
@@ -454,6 +463,46 @@ def _list_workspace_files(container_id: str) -> set[str]:
     return set()
 
 
+T = TypeVar("T")
+
+_PROGRESS_HEARTBEAT_INTERVAL = 5.0  # seconds between SSE keep-alive heartbeats
+
+
+async def _run_with_progress(
+    ctx: Context | None,
+    fn: Callable[..., T],
+    *args: Any,
+    interval: float = _PROGRESS_HEARTBEAT_INTERVAL,
+    **kwargs: Any,
+) -> T:
+    """Run a blocking *fn* in a thread, sending MCP progress heartbeats.
+
+    Heartbeats are ``notifications/progress`` messages sent every *interval*
+    seconds.  They keep the SSE connection alive so the client does not hit
+    an ``httpx.ReadTimeout`` while the server is busy (e.g. installing large
+    packages).
+
+    When *ctx* is ``None`` (e.g. direct calls from tests) the function is
+    still offloaded to a thread but no heartbeats are emitted.
+    """
+    loop = asyncio.get_event_loop()
+    future = loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
+    if ctx is None:
+        # No MCP context — just await the result (tests, direct calls).
+        return await future
+
+    heartbeat = 0
+    while True:
+        done, _ = await asyncio.wait({future}, timeout=interval)
+        if done:
+            # Final "complete" notification.
+            await ctx.report_progress(progress=1, total=1)
+            return future.result()
+        heartbeat += 1
+        await ctx.report_progress(progress=heartbeat, total=heartbeat + 1)
+
+
 # ---------------------------------------------------------------------------
 # MCP Tool definitions
 # ---------------------------------------------------------------------------
@@ -478,75 +527,84 @@ Examples:
   install_packages(packages="numpy matplotlib")
   install_packages(packages="torch torchvision --index-url https://download.pytorch.org/whl/cpu")""",
 )
-def install_packages(packages: str | None = None, session_id: str | None = None) -> str:
+async def install_packages(
+    packages: str | None = None,
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
     if not packages:
         return json.dumps({"status": "error", "error": "No packages specified"}, indent=2)
 
-    session_id = _get_session_id(session_id)
-    data_path = _get_data_path(session_id)
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
 
-    try:
-        container_info = _manager.get_or_create_container(session_id, data_path)
-        if not _manager.enable_network(container_info.container_id):
+        try:
+            container_info = _manager.get_or_create_container(sid, data_path)
+            if not _manager.enable_network(container_info.container_id):
+                return json.dumps(
+                    {
+                        "packages": packages,
+                        "installed": [],
+                        "status": "error",
+                        "output": "Failed to enable network access for pip install.",
+                    },
+                    indent=2,
+                )
+
+            try:
+                exit_code, output = _manager.exec_in_container(
+                    container_info.container_id,
+                    f"pip install --user {packages}",
+                    timeout=INSTALL_TIMEOUT,
+                )
+
+                installed = []
+                if exit_code == 0:
+                    # Parse successfully installed packages from pip output
+                    for line in output.split("\n"):
+                        if line.strip().startswith("Successfully installed"):
+                            installed = [
+                                pkg.rsplit("-", 1)[0] for pkg in line.strip().split()[2:]
+                            ]
+                            break
+                    if not installed:
+                        # Fallback: assume requested packages were installed
+                        installed = [p for p in packages.split() if not p.startswith("-")]
+                    container_info.installed_packages.extend(installed)
+
+                return json.dumps(
+                    {
+                        "packages": packages,
+                        "installed": installed,
+                        "status": "ok" if exit_code == 0 else "error",
+                        "output": output[-5000:],
+                    },
+                    indent=2,
+                )
+            finally:
+                if not container_info.network_enabled:
+                    _manager.disable_network(container_info.container_id)
+
+        except DockerNotAvailableError:
             return json.dumps(
                 {
                     "packages": packages,
                     "installed": [],
                     "status": "error",
-                    "output": "Failed to enable network access for pip install.",
+                    "output": "Docker is not available. "
+                    "Please install Docker and ensure it is running.",
                 },
                 indent=2,
             )
-
-        try:
-            exit_code, output = _manager.exec_in_container(
-                container_info.container_id,
-                f"pip install --user {packages}",
-                timeout=INSTALL_TIMEOUT,
-            )
-
-            installed = []
-            if exit_code == 0:
-                # Parse successfully installed packages from pip output
-                for line in output.split("\n"):
-                    if line.strip().startswith("Successfully installed"):
-                        installed = [pkg.rsplit("-", 1)[0] for pkg in line.strip().split()[2:]]
-                        break
-                if not installed:
-                    # Fallback: assume requested packages were installed
-                    installed = [p for p in packages.split() if not p.startswith("-")]
-                container_info.installed_packages.extend(installed)
-
+        except Exception as e:
+            logger.exception("Error in install_packages")
             return json.dumps(
-                {
-                    "packages": packages,
-                    "installed": installed,
-                    "status": "ok" if exit_code == 0 else "error",
-                    "output": output[-5000:],
-                },
+                {"packages": packages, "installed": [], "status": "error", "output": str(e)},
                 indent=2,
             )
-        finally:
-            if not container_info.network_enabled:
-                _manager.disable_network(container_info.container_id)
 
-    except DockerNotAvailableError:
-        return json.dumps(
-            {
-                "packages": packages,
-                "installed": [],
-                "status": "error",
-                "output": "Docker is not available. "
-                "Please install Docker and ensure it is running.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        logger.exception("Error in install_packages")
-        return json.dumps(
-            {"packages": packages, "installed": [], "status": "error", "output": str(e)},
-            indent=2,
-        )
+    return await _run_with_progress(ctx, _impl)
 
 
 @mcp.tool(
@@ -581,90 +639,95 @@ Examples:
   run_code(command="python simulate_ekf.py", timeout=300)
   run_code(command="python download_data.py", network=True)""",
 )
-def run_code(
+async def run_code(
     command: str | None = None,
     timeout: int = 120,
     network: bool = False,
     session_id: str | None = None,
+    ctx: Context | None = None,
 ) -> str:
     if not command:
         return json.dumps({"status": "error", "error": "No command specified"}, indent=2)
 
-    timeout = min(timeout, MAX_TIMEOUT)
-    session_id = _get_session_id(session_id)
-    data_path = _get_data_path(session_id)
+    clamped_timeout = min(timeout, MAX_TIMEOUT)
 
-    try:
-        container_info = _manager.get_or_create_container(session_id, data_path)
-
-        # Enable network temporarily if requested (and not already persistent)
-        temp_network = False
-        if network and not container_info.network_enabled:
-            temp_network = _manager.enable_network(container_info.container_id)
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
 
         try:
-            # Snapshot files before execution
-            files_before = _list_workspace_files(container_info.container_id)
+            container_info = _manager.get_or_create_container(sid, data_path)
 
-            exit_code, stdout, stderr = _manager.exec_in_container(
-                container_info.container_id,
-                command,
-                timeout=timeout,
-                split_output=True,
-            )
+            # Enable network temporarily if requested (and not already persistent)
+            temp_network = False
+            if network and not container_info.network_enabled:
+                temp_network = _manager.enable_network(container_info.container_id)
 
-            # Detect new files
-            files_after = _list_workspace_files(container_info.container_id)
-            files_created = sorted(files_after - files_before)
+            try:
+                # Snapshot files before execution
+                files_before = _list_workspace_files(container_info.container_id)
 
-            if exit_code == -1 and "timed out" in stderr:
-                status = "timeout"
-            elif exit_code == 0:
-                status = "ok"
-            else:
-                status = "error"
+                exit_code, stdout, stderr = _manager.exec_in_container(
+                    container_info.container_id,
+                    command,
+                    timeout=clamped_timeout,
+                    split_output=True,
+                )
 
+                # Detect new files
+                files_after = _list_workspace_files(container_info.container_id)
+                files_created = sorted(files_after - files_before)
+
+                if exit_code == -1 and "timed out" in stderr:
+                    status = "timeout"
+                elif exit_code == 0:
+                    status = "ok"
+                else:
+                    status = "error"
+
+                return json.dumps(
+                    {
+                        "command": command,
+                        "stdout": stdout[-10000:],
+                        "stderr": stderr[-10000:],
+                        "returncode": exit_code,
+                        "status": status,
+                        "files_created": files_created,
+                    },
+                    indent=2,
+                )
+            finally:
+                if temp_network:
+                    _manager.disable_network(container_info.container_id)
+
+        except DockerNotAvailableError:
             return json.dumps(
                 {
                     "command": command,
-                    "stdout": stdout[-10000:],
-                    "stderr": stderr[-10000:],
-                    "returncode": exit_code,
-                    "status": status,
-                    "files_created": files_created,
+                    "stdout": "",
+                    "stderr": "Docker is not available. "
+                    "Please install Docker and ensure it is running.",
+                    "returncode": -1,
+                    "status": "error",
+                    "files_created": [],
                 },
                 indent=2,
             )
-        finally:
-            if temp_network:
-                _manager.disable_network(container_info.container_id)
+        except Exception as e:
+            logger.exception("Error in run_code")
+            return json.dumps(
+                {
+                    "command": command,
+                    "stdout": "",
+                    "stderr": str(e),
+                    "returncode": -1,
+                    "status": "error",
+                    "files_created": [],
+                },
+                indent=2,
+            )
 
-    except DockerNotAvailableError:
-        return json.dumps(
-            {
-                "command": command,
-                "stdout": "",
-                "stderr": "Docker is not available. "
-                "Please install Docker and ensure it is running.",
-                "returncode": -1,
-                "status": "error",
-                "files_created": [],
-            },
-            indent=2,
-        )
-    except Exception as e:
-        logger.exception("Error in run_code")
-        return json.dumps(
-            {
-                "command": command,
-                "stdout": "",
-                "stderr": str(e),
-                "returncode": -1,
-                "status": "error",
-                "files_created": [],
-            },
-            indent=2,
-        )
+    return await _run_with_progress(ctx, _impl)
 
 
 @mcp.tool(
@@ -678,30 +741,49 @@ Args:
 Returns JSON: {status, python_version, installed_packages,
 disk_usage_mb, uptime_seconds, gpu_available}""",
 )
-def sandbox_status(session_id: str | None = None) -> str:
-    try:
-        docker_available = _manager._check_docker()
-        gpu_available = _manager._check_gpu() if docker_available else False
-        session_id = _get_session_id(session_id)
+async def sandbox_status(
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        try:
+            docker_available = _manager._check_docker()
+            gpu_available = _manager._check_gpu() if docker_available else False
+            sid = _get_session_id(session_id)
 
-        if not docker_available:
-            return json.dumps(
-                {
-                    "status": "not_created",
-                    "python_version": None,
-                    "installed_packages": [],
-                    "disk_usage_mb": 0,
-                    "uptime_seconds": 0,
-                    "gpu_available": False,
-                },
-                indent=2,
-            )
-
-        with _manager._lock:
-            if session_id not in _manager._containers:
+            if not docker_available:
                 return json.dumps(
                     {
                         "status": "not_created",
+                        "python_version": None,
+                        "installed_packages": [],
+                        "disk_usage_mb": 0,
+                        "uptime_seconds": 0,
+                        "gpu_available": False,
+                    },
+                    indent=2,
+                )
+
+            with _manager._lock:
+                if sid not in _manager._containers:
+                    return json.dumps(
+                        {
+                            "status": "not_created",
+                            "python_version": None,
+                            "installed_packages": [],
+                            "disk_usage_mb": 0,
+                            "uptime_seconds": 0,
+                            "gpu_available": gpu_available,
+                        },
+                        indent=2,
+                    )
+                info = _manager._containers[sid]
+
+            running = _manager._is_container_running(info.container_id)
+            if not running:
+                return json.dumps(
+                    {
+                        "status": "stopped",
                         "python_version": None,
                         "installed_packages": [],
                         "disk_usage_mb": 0,
@@ -710,65 +792,52 @@ def sandbox_status(session_id: str | None = None) -> str:
                     },
                     indent=2,
                 )
-            info = _manager._containers[session_id]
 
-        running = _manager._is_container_running(info.container_id)
-        if not running:
+            # Get Python version
+            exit_code, py_version = _manager.exec_in_container(
+                info.container_id,
+                "python3 --version 2>&1 | awk '{print $2}'",
+                timeout=10,
+            )
+            python_version = py_version.strip() if exit_code == 0 else None
+
+            # Get installed packages
+            packages = _manager.list_installed_packages(info.container_id)
+            # Parse package names (format: "name==version")
+            package_names = [p.split("==")[0] for p in packages]
+
+            # Get disk usage
+            exit_code, du_output = _manager.exec_in_container(
+                info.container_id,
+                "du -sm /workspace 2>/dev/null | awk '{print $1}'",
+                timeout=10,
+            )
+            try:
+                disk_usage_mb = float(du_output.strip()) if exit_code == 0 else 0
+            except (ValueError, TypeError):
+                disk_usage_mb = 0
+
+            # Calculate uptime
+            uptime_seconds = (datetime.now() - info.created_at).total_seconds()
+
             return json.dumps(
                 {
-                    "status": "stopped",
-                    "python_version": None,
-                    "installed_packages": [],
-                    "disk_usage_mb": 0,
-                    "uptime_seconds": 0,
+                    "status": "running",
+                    "python_version": python_version,
+                    "installed_packages": package_names,
+                    "disk_usage_mb": disk_usage_mb,
+                    "uptime_seconds": round(uptime_seconds),
                     "gpu_available": gpu_available,
+                    "network_enabled": info.network_enabled,
                 },
                 indent=2,
             )
 
-        # Get Python version
-        exit_code, py_version = _manager.exec_in_container(
-            info.container_id,
-            "python3 --version 2>&1 | awk '{print $2}'",
-            timeout=10,
-        )
-        python_version = py_version.strip() if exit_code == 0 else None
+        except Exception as e:
+            logger.exception("Error in sandbox_status")
+            return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
-        # Get installed packages
-        packages = _manager.list_installed_packages(info.container_id)
-        # Parse package names (format: "name==version")
-        package_names = [p.split("==")[0] for p in packages]
-
-        # Get disk usage
-        exit_code, du_output = _manager.exec_in_container(
-            info.container_id,
-            "du -sm /workspace 2>/dev/null | awk '{print $1}'",
-            timeout=10,
-        )
-        try:
-            disk_usage_mb = float(du_output.strip()) if exit_code == 0 else 0
-        except (ValueError, TypeError):
-            disk_usage_mb = 0
-
-        # Calculate uptime
-        uptime_seconds = (datetime.now() - info.created_at).total_seconds()
-
-        return json.dumps(
-            {
-                "status": "running",
-                "python_version": python_version,
-                "installed_packages": package_names,
-                "disk_usage_mb": disk_usage_mb,
-                "uptime_seconds": round(uptime_seconds),
-                "gpu_available": gpu_available,
-                "network_enabled": info.network_enabled,
-            },
-            indent=2,
-        )
-
-    except Exception as e:
-        logger.exception("Error in sandbox_status")
-        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+    return await _run_with_progress(ctx, _impl)
 
 
 @mcp.tool(
@@ -791,31 +860,37 @@ Args:
 
 Returns JSON: {status, network_enabled}""",
 )
-def enable_sandbox_network(session_id: str | None = None) -> str:
-    session_id = _get_session_id(session_id)
-    data_path = _get_data_path(session_id)
+async def enable_sandbox_network(
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
 
-    try:
-        container_info = _manager.get_or_create_container(session_id, data_path)
-        success = _manager.enable_network(container_info.container_id)
-        if success:
-            container_info.network_enabled = True
+        try:
+            container_info = _manager.get_or_create_container(sid, data_path)
+            success = _manager.enable_network(container_info.container_id)
+            if success:
+                container_info.network_enabled = True
+                return json.dumps(
+                    {"status": "ok", "network_enabled": True},
+                    indent=2,
+                )
             return json.dumps(
-                {"status": "ok", "network_enabled": True},
+                {"status": "error", "error": "Failed to enable network access"},
                 indent=2,
             )
-        return json.dumps(
-            {"status": "error", "error": "Failed to enable network access"},
-            indent=2,
-        )
-    except DockerNotAvailableError:
-        return json.dumps(
-            {"status": "error", "error": "Docker is not available"},
-            indent=2,
-        )
-    except Exception as e:
-        logger.exception("Error in enable_sandbox_network")
-        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+        except DockerNotAvailableError:
+            return json.dumps(
+                {"status": "error", "error": "Docker is not available"},
+                indent=2,
+            )
+        except Exception as e:
+            logger.exception("Error in enable_sandbox_network")
+            return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+    return await _run_with_progress(ctx, _impl)
 
 
 @mcp.tool(
@@ -831,31 +906,37 @@ Args:
 
 Returns JSON: {status, network_enabled}""",
 )
-def disable_sandbox_network(session_id: str | None = None) -> str:
-    session_id = _get_session_id(session_id)
-    data_path = _get_data_path(session_id)
+async def disable_sandbox_network(
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
 
-    try:
-        container_info = _manager.get_or_create_container(session_id, data_path)
-        success = _manager.disable_network(container_info.container_id)
-        if success:
-            container_info.network_enabled = False
+        try:
+            container_info = _manager.get_or_create_container(sid, data_path)
+            success = _manager.disable_network(container_info.container_id)
+            if success:
+                container_info.network_enabled = False
+                return json.dumps(
+                    {"status": "ok", "network_enabled": False},
+                    indent=2,
+                )
             return json.dumps(
-                {"status": "ok", "network_enabled": False},
+                {"status": "error", "error": "Failed to disable network access"},
                 indent=2,
             )
-        return json.dumps(
-            {"status": "error", "error": "Failed to disable network access"},
-            indent=2,
-        )
-    except DockerNotAvailableError:
-        return json.dumps(
-            {"status": "error", "error": "Docker is not available"},
-            indent=2,
-        )
-    except Exception as e:
-        logger.exception("Error in disable_sandbox_network")
-        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+        except DockerNotAvailableError:
+            return json.dumps(
+                {"status": "error", "error": "Docker is not available"},
+                indent=2,
+            )
+        except Exception as e:
+            logger.exception("Error in disable_sandbox_network")
+            return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+    return await _run_with_progress(ctx, _impl)
 
 
 # ---------------------------------------------------------------------------
