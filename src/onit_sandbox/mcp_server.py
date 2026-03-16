@@ -739,6 +739,7 @@ using write_file, or pass it inline via "python -c '...'".
 Similarly, files created inside the sandbox (plots, CSVs, etc.)
 exist only in the sandbox's /workspace directory — they are NOT
 automatically available on your local filesystem.
+To retrieve sandbox files locally, use the download_file tool.
 
 IMPORTANT — Network access:
 By default the sandbox has NO internet access. If your code needs to
@@ -818,17 +819,20 @@ async def run_code(
                 else:
                     status = "error"
 
-                return json.dumps(
-                    {
-                        "command": command,
-                        "stdout": stdout[-10000:],
-                        "stderr": stderr[-10000:],
-                        "returncode": exit_code,
-                        "status": status,
-                        "files_created": files_created,
-                    },
-                    indent=2,
-                )
+                result_payload: dict[str, Any] = {
+                    "command": command,
+                    "stdout": stdout[-10000:],
+                    "stderr": stderr[-10000:],
+                    "returncode": exit_code,
+                    "status": status,
+                    "files_created": files_created,
+                }
+                if files_created:
+                    result_payload["hint"] = (
+                        "These files exist only inside the sandbox container. "
+                        "Use the download_file tool to copy them to your local filesystem."
+                    )
+                return json.dumps(result_payload, indent=2)
             finally:
                 if temp_network:
                     _manager.disable_network(container_info.container_id)
@@ -1110,7 +1114,11 @@ async def disable_sandbox_network(
     title="Download File from Sandbox",
     description="""Copy a file from the sandbox container to the local (agent) filesystem.
 
-Use this to retrieve files created by sandbox code — plots, CSVs, model
+IMPORTANT: This is the ONLY correct way to retrieve files from the sandbox.
+Do NOT use shell commands like 'docker cp' or other workarounds — always
+use this tool to copy files out of the sandbox.
+
+Use this whenever sandbox code creates output files — plots, CSVs, model
 checkpoints, logs, etc. — so they are available on your local filesystem
 for inspection, further processing, or delivery to the user.
 
