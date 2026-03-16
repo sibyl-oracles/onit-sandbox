@@ -273,6 +273,21 @@ class SandboxManager:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
 
+    @staticmethod
+    def _build_exec_cmd(
+        container_id: str,
+        command: str,
+        workdir: str = "/workspace",
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        """Build a ``docker exec`` command list."""
+        cmd = ["docker", "exec", "-w", workdir]
+        if env:
+            for key, value in env.items():
+                cmd.extend(["-e", f"{key}={value}"])
+        cmd.extend([container_id, "sh", "-c", command])
+        return cmd
+
     @overload
     def exec_in_container(
         self,
@@ -295,21 +310,6 @@ class SandboxManager:
         env: dict[str, str] | None = ...,
         split_output: Literal[False] = ...,
     ) -> tuple[int, str]: ...
-
-    @staticmethod
-    def _build_exec_cmd(
-        container_id: str,
-        command: str,
-        workdir: str = "/workspace",
-        env: dict[str, str] | None = None,
-    ) -> list[str]:
-        """Build a ``docker exec`` command list."""
-        cmd = ["docker", "exec", "-w", workdir]
-        if env:
-            for key, value in env.items():
-                cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend([container_id, "sh", "-c", command])
-        return cmd
 
     def exec_in_container(
         self,
