@@ -15,19 +15,27 @@ docker:
   sandbox_image: onit-sandbox:latest
   # Fallback image if sandbox_image not available
   fallback_image: python:3.12-slim
-  
+
   # Resource limits
-  memory_limit: 512m
+  memory_limit: 2g
   cpu_quota: 100000  # 1 CPU
-  pids_limit: 100
-  
+  pids_limit: 256
+
   # Network settings
   network_disabled_default: true
-  
+
   # Timeouts (in seconds)
   default_timeout: 60
   install_timeout: 300
-  max_timeout: 600
+  max_timeout: 3600
+
+  # Maximum bytes of stdout/stderr returned per tool call
+  max_output_bytes: 50000
+
+  # Data volume mounts — mount host directories into the sandbox.
+  # Each entry is "host_path:container_path:mode" where mode is "ro" or "rw".
+  # Example: ["/data:/data:ro", "/models:/models:rw"]
+  data_mounts: []
 
 # Logging configuration
 logging:

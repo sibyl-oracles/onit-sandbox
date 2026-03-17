@@ -75,17 +75,28 @@ def cmd_start(args: argparse.Namespace) -> None:
 
 def _run_foreground(args: argparse.Namespace) -> None:
     """Run the server in the foreground (blocking)."""
-    from onit_sandbox.mcp_server import _server  # noqa: F811
+    from onit_sandbox.mcp_server import run as mcp_run
 
-    _server.host = args.host
-    _server.port = args.port
-    _server.transport = args.transport
-    _server.verbose = args.verbose
+    mounts = getattr(args, "mount", None) or []
 
-    print(f"Starting Sandbox MCP Server on {_server.url} (transport: {args.transport})")
+    print(f"Starting Sandbox MCP Server on "
+          f"{build_server_url(args.host, args.port, args.transport)} "
+          f"(transport: {args.transport})")
+    if mounts:
+        print(f"Data mounts: {', '.join(mounts)}")
+
     _write_pid(os.getpid())
     try:
-        _server.run()
+        mcp_run(
+            transport=args.transport,
+            host=args.host,
+            port=args.port,
+            options={
+                "data_path": getattr(args, "data_path", "/tmp/onit/data"),
+                "verbose": args.verbose,
+                "data_mounts": mounts,
+            },
+        )
     finally:
         _remove_pid()
 
@@ -109,6 +120,8 @@ def _run_background(args: argparse.Namespace) -> None:
     ]
     if args.verbose:
         cmd.append("--verbose")
+    for m in getattr(args, "mount", None) or []:
+        cmd.extend(["--mount", m])
 
     log_fh = open(LOG_FILE, "a")
     process = subprocess.Popen(
@@ -201,6 +214,18 @@ def build_parser() -> argparse.ArgumentParser:
     start_p.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     start_p.add_argument(
         "--data-path", default="/tmp/onit/data", help="Default data directory for file storage"
+    )
+    start_p.add_argument(
+        "--mount",
+        action="append",
+        default=[],
+        metavar="HOST:CONTAINER[:MODE]",
+        help=(
+            "Mount a host directory into the sandbox container. "
+            "MODE is 'ro' (read-only, default) or 'rw'. "
+            "Can be specified multiple times. "
+            "Example: --mount /data:/data:ro --mount /models:/models:rw"
+        ),
     )
 
     # stop

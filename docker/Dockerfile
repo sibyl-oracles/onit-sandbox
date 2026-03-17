@@ -25,8 +25,19 @@ RUN pip install --no-cache-dir \
     sympy \
     pytest
 
-# Set up workspace directory
-RUN mkdir -p /workspace && chown sandbox:sandbox /workspace
+# Install data pipeline and evaluation packages
+RUN pip install --no-cache-dir \
+    datasets \
+    transformers \
+    safetensors \
+    tensorboard \
+    tqdm \
+    pyyaml \
+    jsonlines \
+    pillow
+
+# Set up workspace and data directories
+RUN mkdir -p /workspace /data && chown sandbox:sandbox /workspace /data
 
 # Ensure pip cache and user-install dirs are writable by sandbox user
 RUN mkdir -p /home/sandbox/.cache/pip /home/sandbox/.local \
