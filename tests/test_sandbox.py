@@ -14,12 +14,12 @@ import onit_sandbox.mcp_server as mcp_module
 from onit_sandbox.mcp_server import (
     SandboxManager,
     cleanup_sandbox,
-    disable_sandbox_network,
-    download_file,
-    enable_sandbox_network,
-    install_packages,
-    run_code,
-    sandbox_status,
+    sandbox_disable_network,
+    sandbox_download_file,
+    sandbox_enable_network,
+    sandbox_install_packages,
+    sandbox_run_code,
+    sandbox_get_status,
 )
 
 
@@ -67,37 +67,37 @@ class TestSandboxManager:
 class TestSandboxTools:
     """Tests for the MCP tool functions."""
 
-    def test_sandbox_status_no_container(self):
-        """Test sandbox_status when no container exists."""
+    def test_sandbox_get_status_no_container(self):
+        """Test sandbox_get_status when no container exists."""
         mcp_module.SESSION_ID = "nonexistent-session-id"
         try:
-            result = _run(sandbox_status())
+            result = _run(sandbox_get_status())
             data = json.loads(result)
             assert data["status"] in ("not_created", "error")
         finally:
             mcp_module.SESSION_ID = None
 
-    def test_install_packages_no_packages(self):
-        """Test install_packages with no packages specified."""
-        result = _run(install_packages(packages=None))
+    def test_sandbox_install_packages_no_packages(self):
+        """Test sandbox_install_packages with no packages specified."""
+        result = _run(sandbox_install_packages(packages=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
-    def test_run_code_no_command(self):
-        """Test run_code with no command specified."""
-        result = _run(run_code(command=None))
+    def test_sandbox_run_code_no_command(self):
+        """Test sandbox_run_code with no command specified."""
+        result = _run(sandbox_run_code(command=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
-    def test_download_file_no_sandbox_path(self):
-        """Test download_file with no sandbox_path specified."""
-        result = _run(download_file(sandbox_path=None, dest_path="/tmp/out.txt"))
+    def test_sandbox_download_file_no_sandbox_path(self):
+        """Test sandbox_download_file with no sandbox_path specified."""
+        result = _run(sandbox_download_file(sandbox_path=None, dest_path="/tmp/out.txt"))
         data = json.loads(result)
         assert data["status"] == "error"
 
-    def test_download_file_no_dest_path(self):
-        """Test download_file with no dest_path specified."""
-        result = _run(download_file(sandbox_path="file.txt", dest_path=None))
+    def test_sandbox_download_file_no_dest_path(self):
+        """Test sandbox_download_file with no dest_path specified."""
+        result = _run(sandbox_download_file(sandbox_path="file.txt", dest_path=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
@@ -109,9 +109,9 @@ class TestSandboxTools:
 class TestSandboxWithDocker:
     """Tests that require Docker to be available."""
 
-    def test_run_code_simple_command(self, sandbox_session):
+    def test_sandbox_run_code_simple_command(self, sandbox_session):
         """Test running a simple command in sandbox."""
-        result = _run(run_code(command="echo 'Hello, World!'"))
+        result = _run(sandbox_run_code(command="echo 'Hello, World!'"))
         data = json.loads(result)
 
         assert data["status"] == "ok"
@@ -119,18 +119,18 @@ class TestSandboxWithDocker:
         assert data["returncode"] == 0
         assert isinstance(data["files_created"], list)
 
-    def test_run_code_python(self, sandbox_session):
+    def test_sandbox_run_code_python(self, sandbox_session):
         """Test running Python code in sandbox."""
-        result = _run(run_code(command="python -c \"print('Python works!')\""))
+        result = _run(sandbox_run_code(command="python -c \"print('Python works!')\""))
         data = json.loads(result)
 
-        assert data["status"] == "ok", f"run_code failed: {data}"
+        assert data["status"] == "ok", f"sandbox_run_code failed: {data}"
         assert "Python works!" in data["stdout"]
 
-    def test_install_packages_and_run(self, sandbox_session):
+    def test_sandbox_install_packages_and_run(self, sandbox_session):
         """Test installing a package and using it."""
         # Install a small package
-        install_result = _run(install_packages(packages="cowsay"))
+        install_result = _run(sandbox_install_packages(packages="cowsay"))
         install_data = json.loads(install_result)
 
         assert install_data["status"] == "ok"
@@ -139,7 +139,7 @@ class TestSandboxWithDocker:
 
         # Run Python with the package
         run_result = _run(
-            run_code(command="python -c 'import cowsay; cowsay.cow(\"moo\")'"),
+            sandbox_run_code(command="python -c 'import cowsay; cowsay.cow(\"moo\")'"),
         )
         run_data = json.loads(run_result)
         assert run_data["status"] == "ok"
@@ -147,19 +147,19 @@ class TestSandboxWithDocker:
     def test_files_created_detection(self, sandbox_session):
         """Test that files_created detects new files after execution."""
         result = _run(
-            run_code(command="echo 'test content' > /workspace/testfile.txt"),
+            sandbox_run_code(command="echo 'test content' > /workspace/testfile.txt"),
         )
         data = json.loads(result)
 
         if data["status"] == "ok":
             assert "testfile.txt" in data["files_created"]
 
-    def test_sandbox_status_running(self, sandbox_session):
-        """Test sandbox_status when container is running."""
+    def test_sandbox_get_status_running(self, sandbox_session):
+        """Test sandbox_get_status when container is running."""
         # First, create a container by running a command
-        _run(run_code(command="echo hello"))
+        _run(sandbox_run_code(command="echo hello"))
 
-        result = _run(sandbox_status())
+        result = _run(sandbox_get_status())
         data = json.loads(result)
 
         assert data["status"] == "running"
@@ -168,18 +168,18 @@ class TestSandboxWithDocker:
         assert isinstance(data["disk_usage_mb"], int | float)
         assert isinstance(data["uptime_seconds"], int)
 
-    def test_run_code_timeout(self, sandbox_session):
-        """Test that run_code respects timeout."""
-        result = _run(run_code(command="sleep 10", timeout=2))
+    def test_sandbox_run_code_timeout(self, sandbox_session):
+        """Test that sandbox_run_code respects timeout."""
+        result = _run(sandbox_run_code(command="sleep 10", timeout=2))
         data = json.loads(result)
 
         assert data["status"] == "timeout"
         assert data["returncode"] == -1
 
-    def test_run_code_with_network(self, sandbox_session):
-        """Test run_code with temporary network access."""
+    def test_sandbox_run_code_with_network(self, sandbox_session):
+        """Test sandbox_run_code with temporary network access."""
         result = _run(
-            run_code(
+            sandbox_run_code(
                 command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
                 network=True,
                 timeout=30,
@@ -189,16 +189,16 @@ class TestSandboxWithDocker:
         assert data["status"] == "ok"
         assert "200" in data["stdout"]
 
-    def test_download_file(self, sandbox_session):
+    def test_sandbox_download_file(self, sandbox_session):
         """Test copying a file from the sandbox to the local filesystem."""
         session_id, tmp_path = sandbox_session
 
         # Create a file inside the sandbox
-        _run(run_code(command="echo 'download test' > /workspace/dl_test.txt"))
+        _run(sandbox_run_code(command="echo 'download test' > /workspace/dl_test.txt"))
 
         # Download it to a local path
         dest = str(tmp_path / "downloaded.txt")
-        result = _run(download_file(sandbox_path="dl_test.txt", dest_path=dest))
+        result = _run(sandbox_download_file(sandbox_path="dl_test.txt", dest_path=dest))
         data = json.loads(result)
 
         assert data["status"] == "ok"
@@ -208,15 +208,15 @@ class TestSandboxWithDocker:
         with open(dest) as f:
             assert "download test" in f.read()
 
-    def test_download_file_not_found(self, sandbox_session):
+    def test_sandbox_download_file_not_found(self, sandbox_session):
         """Test downloading a nonexistent file from the sandbox."""
         session_id, tmp_path = sandbox_session
 
         # Ensure sandbox is running
-        _run(run_code(command="echo hello"))
+        _run(sandbox_run_code(command="echo hello"))
 
         dest = str(tmp_path / "missing.txt")
-        result = _run(download_file(sandbox_path="no_such_file.txt", dest_path=dest))
+        result = _run(sandbox_download_file(sandbox_path="no_such_file.txt", dest_path=dest))
         data = json.loads(result)
 
         assert data["status"] == "error"
@@ -225,18 +225,18 @@ class TestSandboxWithDocker:
     def test_enable_disable_network(self, sandbox_session):
         """Test persistent network enable/disable tools."""
         # Create container first
-        _run(run_code(command="echo hello"))
+        _run(sandbox_run_code(command="echo hello"))
 
         # Enable persistent network
-        result = _run(enable_sandbox_network())
+        result = _run(sandbox_enable_network())
         data = json.loads(result)
         assert data["status"] == "ok"
         assert data["network_enabled"] is True
 
-        # Verify network works in run_code without network=True flag
-        # (bridge stays connected since enable_sandbox_network connected it)
+        # Verify network works in sandbox_run_code without network=True flag
+        # (bridge stays connected since sandbox_enable_network connected it)
         result = _run(
-            run_code(
+            sandbox_run_code(
                 command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
                 timeout=30,
             ),
@@ -246,18 +246,18 @@ class TestSandboxWithDocker:
         assert "200" in run_data["stdout"]
 
         # Check status reports network_enabled
-        status_result = _run(sandbox_status())
+        status_result = _run(sandbox_get_status())
         status_data = json.loads(status_result)
         assert status_data["network_enabled"] is True
 
         # Disable network
-        result = _run(disable_sandbox_network())
+        result = _run(sandbox_disable_network())
         data = json.loads(result)
         assert data["status"] == "ok"
         assert data["network_enabled"] is False
 
         # Verify status updated
-        status_result = _run(sandbox_status())
+        status_result = _run(sandbox_get_status())
         status_data = json.loads(status_result)
         assert status_data["network_enabled"] is False
 

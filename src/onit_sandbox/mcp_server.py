@@ -6,10 +6,14 @@ Python projects without affecting the host system. Each session gets its own
 container with resource limits, network isolation, and a shared workspace.
 
 Tools:
-- install_packages: Install Python packages in the sandbox
-- run_code: Execute commands in the isolated sandbox
-- sandbox_status: Inspect sandbox state, packages, and resource usage
-- download_file: Copy a file from the sandbox to the local filesystem
+- sandbox_install_packages: Install Python packages in the sandbox
+- sandbox_run_code: Execute commands in the isolated sandbox
+- sandbox_get_status: Inspect sandbox state, packages, and resource usage
+- sandbox_write_file: Write files into the sandbox
+- sandbox_list_files: List files in the sandbox filesystem
+- sandbox_download_file: Copy a file from the sandbox to the local filesystem
+- sandbox_enable_network: Enable persistent internet access
+- sandbox_disable_network: Disable internet access
 """
 
 from __future__ import annotations
@@ -197,6 +201,8 @@ class SandboxManager:
             "HOME=/home/sandbox",
             "-e",
             "PATH=/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin",
+            "-e",
+            "OMP_NUM_THREADS=4",
         ]
 
         if gpu_available:
@@ -645,10 +651,10 @@ Args:
 Returns JSON: {packages, installed, status, output}
 
 Examples:
-  install_packages(packages="numpy matplotlib")
-  install_packages(packages="torch torchvision --index-url https://download.pytorch.org/whl/cpu")""",
+  sandbox_install_packages(packages="numpy matplotlib")
+  sandbox_install_packages(packages="torch torchvision --index-url https://download.pytorch.org/whl/cpu")""",
 )
-async def install_packages(
+async def sandbox_install_packages(
     packages: str | None = None,
     session_id: str | None = None,
     ctx: Context | None = None,
@@ -698,6 +704,8 @@ async def install_packages(
                         "installed": installed,
                         "status": "ok" if exit_code == 0 else "error",
                         "output": output[-5000:],
+                        "workspace_root": "/workspace",
+                        "host_data_path": data_path,
                     },
                     indent=2,
                 )
@@ -717,7 +725,7 @@ async def install_packages(
                 indent=2,
             )
         except Exception as e:
-            logger.exception("Error in install_packages")
+            logger.exception("Error in sandbox_install_packages")
             return json.dumps(
                 {"packages": packages, "installed": [], "status": "error", "output": str(e)},
                 indent=2,
@@ -734,17 +742,19 @@ CRITICAL — Sandbox isolation:
 The sandbox is a SEPARATE Docker container with its OWN filesystem.
 It is NOT your local filesystem. You CANNOT directly access files
 from your local machine or working directory inside the sandbox.
-To make code available in the sandbox, you must first write it there
-using write_file, or pass it inline via "python -c '...'".
-Similarly, files created inside the sandbox (plots, CSVs, etc.)
-exist only in the sandbox's /workspace directory — they are NOT
-automatically available on your local filesystem.
-To retrieve sandbox files locally, use the download_file tool.
+To make code available in the sandbox, use the sandbox_write_file tool to
+create files, or pass code inline via "python -c '...'".
+To discover what files already exist (e.g., a mounted codebase),
+use the sandbox_list_files tool or sandbox_get_status.
+Files created inside the sandbox (plots, CSVs, etc.) exist only in
+the sandbox's /workspace directory — they are NOT automatically
+available on your local filesystem.
+To retrieve sandbox files locally, use the sandbox_download_file tool.
 
 IMPORTANT — Network access:
 By default the sandbox has NO internet access. If your code needs to
 download datasets, call APIs, or access any remote resource, you MUST
-either set network=True on this call, or call enable_sandbox_network
+either set network=True on this call, or call sandbox_enable_network
 first for persistent access across multiple commands.
 
 Args:
@@ -754,7 +764,7 @@ Args:
   Configurable via SANDBOX_MAX_TIMEOUT env var.
 - network: Set to True to temporarily enable internet access for
   this command. The network is disabled again after the command
-  finishes. For persistent access, use enable_sandbox_network.
+  finishes. For persistent access, use sandbox_enable_network.
 - session_id: Optional identifier to isolate this sandbox from
   other agents. Same session_id = shared container.
 
@@ -762,11 +772,11 @@ Returns JSON: {command, stdout, stderr, returncode, status,
 files_created}
 
 Examples:
-  run_code(command="python main.py")
-  run_code(command="python simulate_ekf.py", timeout=300)
-  run_code(command="python download_data.py", network=True)""",
+  sandbox_run_code(command="python main.py")
+  sandbox_run_code(command="python simulate_ekf.py", timeout=300)
+  sandbox_run_code(command="python download_data.py", network=True)""",
 )
-async def run_code(
+async def sandbox_run_code(
     command: str | None = None,
     timeout: int = 120,
     network: bool = False,
@@ -826,11 +836,13 @@ async def run_code(
                     "returncode": exit_code,
                     "status": status,
                     "files_created": files_created,
+                    "workspace_root": "/workspace",
+                    "host_data_path": data_path,
                 }
                 if files_created:
                     result_payload["hint"] = (
                         "These files exist only inside the sandbox container. "
-                        "Use the download_file tool to copy them to your local filesystem."
+                        "Use the sandbox_download_file tool to copy them to your local filesystem."
                     )
                 return json.dumps(result_payload, indent=2)
             finally:
@@ -851,7 +863,7 @@ async def run_code(
                 indent=2,
             )
         except Exception as e:
-            logger.exception("Error in run_code")
+            logger.exception("Error in sandbox_run_code")
             return json.dumps(
                 {
                     "command": command,
@@ -901,18 +913,241 @@ async def run_code(
 
 
 @mcp.tool(
+    title="Write File to Sandbox",
+    description="""Write content to a file inside the sandbox container.
+
+This is the recommended way to create or update files in the sandbox.
+The sandbox has its OWN filesystem — this tool writes directly into it.
+
+The file path is relative to /workspace (the sandbox root) unless an
+absolute path starting with / is given.
+
+Parent directories are created automatically.
+
+Args:
+- file_path: Path of the file to create/overwrite inside the sandbox.
+  Relative paths are resolved from /workspace
+  (e.g., "src/main.py" → /workspace/src/main.py).
+- content: The full text content to write to the file.
+- session_id: Optional identifier for the target sandbox.
+
+Returns JSON: {status, file_path, size_bytes, workspace_root}
+
+Examples:
+  sandbox_write_file(file_path="main.py", content="print('hello')")
+  sandbox_write_file(file_path="src/utils.py", content="def add(a, b): return a + b")""",
+)
+async def sandbox_write_file(
+    file_path: str | None = None,
+    content: str | None = None,
+    session_id: str | None = None,
+    path: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    # Accept "path" as an alias for "file_path" (common LLM mis-naming)
+    if not file_path and path:
+        file_path = path
+    if not file_path:
+        return json.dumps({"status": "error", "error": "No file_path specified"}, indent=2)
+    if content is None:
+        return json.dumps({"status": "error", "error": "No content specified"}, indent=2)
+
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
+
+        try:
+            container_info = _manager.get_or_create_container(sid, data_path)
+
+            # Normalise to absolute path inside container
+            if not file_path.startswith("/"):
+                container_path = f"/workspace/{file_path}"
+            else:
+                container_path = file_path
+
+            # Ensure parent directory exists
+            parent_dir = os.path.dirname(container_path)
+            if parent_dir and parent_dir != "/":
+                _manager.exec_in_container(
+                    container_info.container_id,
+                    f"mkdir -p '{parent_dir}'",
+                    timeout=10,
+                )
+
+            # Write content via stdin using docker exec + sh -c "cat > file"
+            cmd = [
+                "docker",
+                "exec",
+                "-i",
+                "-w",
+                "/workspace",
+                container_info.container_id,
+                "sh",
+                "-c",
+                f"cat > '{container_path}'",
+            ]
+            result = subprocess.run(
+                cmd,
+                input=content,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": f"Failed to write file: {result.stderr.strip()}",
+                        "file_path": file_path,
+                    },
+                    indent=2,
+                )
+
+            size_bytes = len(content.encode())
+
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "file_path": file_path,
+                    "container_path": container_path,
+                    "size_bytes": size_bytes,
+                    "workspace_root": "/workspace",
+                    "host_data_path": data_path,
+                },
+                indent=2,
+            )
+
+        except DockerNotAvailableError:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Docker is not available.",
+                    "file_path": file_path,
+                },
+                indent=2,
+            )
+        except Exception as e:
+            logger.exception("Error in sandbox_write_file")
+            return json.dumps(
+                {"status": "error", "error": str(e), "file_path": file_path},
+                indent=2,
+            )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="List Files in Sandbox",
+    description="""List files and directories inside the sandbox container.
+
+Use this to explore the sandbox filesystem and discover what files are
+available — especially useful when a codebase has been mounted into the
+sandbox and you need to understand its structure before working with it.
+
+Args:
+- path: Directory path to list, relative to /workspace or absolute.
+  Defaults to "." (the /workspace root).
+- max_depth: How many levels deep to recurse (default: 3).
+  Use 1 for a shallow listing, higher values for deeper exploration.
+- session_id: Optional identifier for the target sandbox.
+
+Returns JSON: {status, path, workspace_root, host_data_path, files}
+
+Examples:
+  sandbox_list_files()  # list /workspace root
+  sandbox_list_files(path="src", max_depth=2)
+  sandbox_list_files(path=".", max_depth=1)  # shallow listing""",
+)
+async def sandbox_list_files(
+    path: str = ".",
+    max_depth: int = 3,
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
+
+        try:
+            container_info = _manager.get_or_create_container(sid, data_path)
+
+            # Normalise to absolute path inside container
+            if not path.startswith("/"):
+                container_path = f"/workspace/{path}"
+            else:
+                container_path = path
+
+            clamped_depth = min(max(max_depth, 1), 10)
+
+            exit_code, output = _manager.exec_in_container(
+                container_info.container_id,
+                f"find '{container_path}' -maxdepth {clamped_depth} -not -path '*/\\.*' "
+                f"\\( -type f -o -type d \\) 2>/dev/null | sort | head -500",
+                timeout=15,
+            )
+
+            files: list[str] = []
+            if exit_code == 0 and output.strip():
+                files = [
+                    line.replace("/workspace/", "", 1)
+                    for line in output.strip().split("\n")
+                    if line.strip()
+                ]
+
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "path": path,
+                    "workspace_root": "/workspace",
+                    "host_data_path": data_path,
+                    "files": files,
+                    "count": len(files),
+                },
+                indent=2,
+            )
+
+        except DockerNotAvailableError:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Docker is not available.",
+                    "path": path,
+                },
+                indent=2,
+            )
+        except Exception as e:
+            logger.exception("Error in sandbox_list_files")
+            return json.dumps(
+                {"status": "error", "error": str(e), "path": path},
+                indent=2,
+            )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
     title="Sandbox Status",
     description="""Check the status of the isolated Docker sandbox container.
-Shows whether the sandbox is running, what packages are installed, and resource usage.
+Shows whether the sandbox is running, what packages are installed, resource usage,
+and a listing of files currently in the workspace.
 This reports on the sandbox environment, which is separate from your local system.
+
+The response includes:
+- workspace_root: The root directory inside the container (/workspace)
+- host_data_path: The corresponding directory on the host filesystem
+- workspace_files: Files currently present in the workspace (up to 200)
+
+Use this tool first to orient yourself and discover what files exist in
+the sandbox before running code.
 
 Args:
 - session_id: Optional identifier to check a specific agent's sandbox.
 
 Returns JSON: {status, python_version, installed_packages,
-disk_usage_mb, uptime_seconds, gpu_available}""",
+disk_usage_mb, uptime_seconds, gpu_available, network_enabled,
+workspace_root, host_data_path, workspace_files}""",
 )
-async def sandbox_status(
+async def sandbox_get_status(
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
@@ -991,6 +1226,9 @@ async def sandbox_status(
             # Calculate uptime
             uptime_seconds = (datetime.now() - info.created_at).total_seconds()
 
+            # List workspace files for filesystem awareness
+            workspace_files = sorted(_list_workspace_files(info.container_id))
+
             return json.dumps(
                 {
                     "status": "running",
@@ -1000,12 +1238,15 @@ async def sandbox_status(
                     "uptime_seconds": round(uptime_seconds),
                     "gpu_available": gpu_available,
                     "network_enabled": info.network_enabled,
+                    "workspace_root": "/workspace",
+                    "host_data_path": info.data_path,
+                    "workspace_files": workspace_files[:200],
                 },
                 indent=2,
             )
 
         except Exception as e:
-            logger.exception("Error in sandbox_status")
+            logger.exception("Error in sandbox_get_status")
             return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
     return await _run_with_progress(ctx, _impl)
@@ -1019,11 +1260,11 @@ Call this BEFORE starting work that requires sustained network access,
 such as downloading datasets, training with remote logging, calling
 external APIs, or any multi-step workflow that needs the internet.
 
-Once enabled, ALL subsequent run_code and install_packages calls in
+Once enabled, ALL subsequent sandbox_run_code and sandbox_install_packages calls in
 this session will have internet access until you call
-disable_sandbox_network.
+sandbox_disable_network.
 
-Prefer this over setting network=True on every run_code call when
+Prefer this over setting network=True on every sandbox_run_code call when
 you have multiple commands that need internet access.
 
 Args:
@@ -1031,7 +1272,7 @@ Args:
 
 Returns JSON: {status, network_enabled}""",
 )
-async def enable_sandbox_network(
+async def sandbox_enable_network(
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
@@ -1058,7 +1299,7 @@ async def enable_sandbox_network(
                 indent=2,
             )
         except Exception as e:
-            logger.exception("Error in enable_sandbox_network")
+            logger.exception("Error in sandbox_enable_network")
             return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
     return await _run_with_progress(ctx, _impl)
@@ -1077,7 +1318,7 @@ Args:
 
 Returns JSON: {status, network_enabled}""",
 )
-async def disable_sandbox_network(
+async def sandbox_disable_network(
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
@@ -1104,7 +1345,7 @@ async def disable_sandbox_network(
                 indent=2,
             )
         except Exception as e:
-            logger.exception("Error in disable_sandbox_network")
+            logger.exception("Error in sandbox_disable_network")
             return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
     return await _run_with_progress(ctx, _impl)
@@ -1116,7 +1357,7 @@ async def disable_sandbox_network(
 
 IMPORTANT: This is the ONLY correct way to retrieve files from the sandbox.
 Do NOT use shell commands like 'docker cp' or other workarounds — always
-use this tool to copy files out of the sandbox.
+use sandbox_download_file to copy files out of the sandbox.
 
 Use this whenever sandbox code creates output files — plots, CSVs, model
 checkpoints, logs, etc. — so they are available on your local filesystem
@@ -1138,10 +1379,10 @@ Args:
 Returns JSON: {status, sandbox_path, dest_path, size_bytes}
 
 Examples:
-  download_file(sandbox_path="results/plot.png", dest_path="/home/user/plot.png")
-  download_file(sandbox_path="model.pt", dest_path="/tmp/model.pt")""",
+  sandbox_download_file(sandbox_path="results/plot.png", dest_path="/home/user/plot.png")
+  sandbox_download_file(sandbox_path="model.pt", dest_path="/tmp/model.pt")""",
 )
-async def download_file(
+async def sandbox_download_file(
     sandbox_path: str | None = None,
     dest_path: str | None = None,
     session_id: str | None = None,
@@ -1227,7 +1468,7 @@ async def download_file(
                 indent=2,
             )
         except Exception as e:
-            logger.exception("Error in download_file")
+            logger.exception("Error in sandbox_download_file")
             return json.dumps(
                 {
                     "status": "error",
