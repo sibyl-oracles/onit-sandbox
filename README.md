@@ -311,7 +311,7 @@ onit-sandbox start [OPTIONS]
   --transport    streamable-http, sse, or stdio (default: streamable-http)
   --foreground   Run in foreground
   --verbose      Enable verbose logging
-  --data-path    Workspace data directory (default: /tmp/onit/data)
+  --data-path    Host data directory, mounted as /workspace inside the sandbox (default: /tmp/onit/data)
   --mount        Mount host directory into sandbox (repeatable)
                  Format: HOST_PATH:CONTAINER_PATH[:MODE]
                  MODE is "ro" (default) or "rw"

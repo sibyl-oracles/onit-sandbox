@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import functools
 import json
 import logging
@@ -50,7 +51,6 @@ from onit_sandbox.server import (
     FALLBACK_IMAGE,
     INSTALL_TIMEOUT,
     MAX_OUTPUT_BYTES,
-    MAX_TIMEOUT,
     SANDBOX_IMAGE,
     SandboxMCPServer,
     parse_data_mounts,
@@ -112,30 +112,53 @@ class SandboxManager:
         return self._docker_available
 
     def _check_gpu(self) -> bool:
-        """Check if the NVIDIA Container Toolkit is available.
+        """Check if a usable NVIDIA GPU is available in Docker.
 
-        Runs ``docker info`` and looks for the ``nvidia`` runtime, which is
-        installed by the NVIDIA Container Toolkit.  The result is cached so
-        the subprocess only runs once per process lifetime.
+        First checks that the NVIDIA runtime is registered, then verifies
+        an actual GPU is accessible by running ``nvidia-smi`` in a
+        throwaway container.  The result is cached so the checks only run
+        once per process lifetime.
         """
         if self._gpu_available is not None:
             return self._gpu_available
 
         try:
+            # Step 1: Check if the NVIDIA runtime is registered
             result = subprocess.run(
                 ["docker", "info", "-f", "{{json .Runtimes}}"],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-            self._gpu_available = result.returncode == 0 and "nvidia" in result.stdout.lower()
+            has_runtime = result.returncode == 0 and "nvidia" in result.stdout.lower()
+
+            if not has_runtime:
+                self._gpu_available = False
+                logger.debug("No NVIDIA GPU runtime found — containers will run CPU-only")
+                return self._gpu_available
+
+            # Step 2: Verify an actual GPU is accessible
+            result = subprocess.run(
+                ["docker", "run", "--rm", "--gpus", "all", "nvidia/cuda:12.0.0-base-ubuntu22.04",
+                 "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self._gpu_available = result.returncode == 0 and bool(result.stdout.strip())
+
+            if self._gpu_available:
+                gpu_names = result.stdout.strip()
+                logger.info("NVIDIA GPU verified — %s", gpu_names)
+            else:
+                logger.warning(
+                    "NVIDIA runtime is installed but no GPU is accessible: %s",
+                    result.stderr.strip(),
+                )
+
         except (subprocess.TimeoutExpired, FileNotFoundError):
             self._gpu_available = False
-
-        if self._gpu_available:
-            logger.info("NVIDIA GPU runtime detected — containers will use --gpus all")
-        else:
-            logger.debug("No NVIDIA GPU runtime found — containers will run CPU-only")
+            logger.debug("GPU check failed — containers will run CPU-only")
 
         return self._gpu_available
 
@@ -258,6 +281,9 @@ class SandboxManager:
                 timeout=10,
             )
 
+            # Add passwd entry for the host UID so pwd.getpwuid() works
+            self._ensure_passwd_entry(container_id)
+
             # Disconnect from bridge immediately — sandbox is network-isolated
             # by default.  enable_network() will reconnect when needed.
             self.disable_network(container_id)
@@ -276,6 +302,30 @@ class SandboxManager:
         except subprocess.TimeoutExpired:
             raise RuntimeError("Timeout creating container")
 
+    def _ensure_passwd_entry(self, container_id: str) -> None:
+        """Ensure the container has a passwd entry for the current UID.
+
+        Without this, Python's ``getpass.getuser()`` / ``pwd.getpwuid()``
+        raises ``KeyError`` because the host UID has no entry in the
+        container's ``/etc/passwd``.
+        """
+        uid, gid = os.getuid(), os.getgid()
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-u",
+                "0",
+                container_id,
+                "sh",
+                "-c",
+                f"grep -q ':{uid}:' /etc/passwd || "
+                f"echo 'sandbox:x:{uid}:{gid}:sandbox:/home/sandbox:/bin/sh' >> /etc/passwd",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+
     def get_or_create_container(
         self,
         session_id: str,
@@ -287,6 +337,7 @@ class SandboxManager:
             if session_id in self._containers:
                 info = self._containers[session_id]
                 if self._is_container_running(info.container_id):
+                    self._ensure_passwd_entry(info.container_id)
                     return info
                 else:
                     del self._containers[session_id]
@@ -377,7 +428,7 @@ class SandboxManager:
         self,
         container_id: str,
         command: str,
-        timeout: int = DEFAULT_TIMEOUT,
+        timeout: int | None = DEFAULT_TIMEOUT,
         workdir: str = "/workspace",
         env: dict[str, str] | None = None,
         on_output: Callable[[str], None] | None = None,
@@ -438,17 +489,21 @@ class SandboxManager:
             t_out.start()
             t_err.start()
 
-            deadline = time.monotonic() + timeout
+            deadline = (time.monotonic() + timeout) if timeout is not None else None
             sentinels_received = 0
 
             while sentinels_received < 2:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _cleanup_proc(proc, t_out, t_err)
-                    return -1, "".join(stdout_lines), f"Command timed out after {timeout} seconds"
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _cleanup_proc(proc, t_out, t_err)
+                        return -1, "".join(stdout_lines), f"Command timed out after {timeout} seconds"
+                    wait_time = min(remaining, 1.0)
+                else:
+                    wait_time = 1.0
 
                 try:
-                    label, line = output_queue.get(timeout=min(remaining, 1.0))
+                    label, line = output_queue.get(timeout=wait_time)
                 except queue.Empty:
                     continue
 
@@ -607,7 +662,7 @@ def _list_workspace_files(container_id: str) -> set[str]:
     """List files in /workspace to detect newly created files."""
     exit_code, output = _manager.exec_in_container(
         container_id,
-        "find /workspace -maxdepth 3 -type f 2>/dev/null",
+        "find /workspace -maxdepth 8 -type f 2>/dev/null",
         timeout=10,
     )
     if exit_code == 0:
@@ -716,6 +771,7 @@ async def sandbox_install_packages(
                 return json.dumps(
                     {
                         "status": "ok" if exit_code == 0 else "error",
+                        "session_id": sid,
                         "installed": installed,
                         "output": output[-MAX_OUTPUT_BYTES:],
                     },
@@ -749,26 +805,31 @@ async def sandbox_install_packages(
     title="Run Code",
     description="""Execute a shell command in the sandbox.
 
-The sandbox has its OWN filesystem — use sandbox_write_file to create files,
-sandbox_list_files to discover them. Check data_mounts in sandbox_get_status
-for pre-mounted datasets. No internet by default; set network=true or call
-sandbox_enable_network first.
+IMPORTANT: The sandbox is an isolated Docker container with its OWN filesystem.
+Host/agent paths (e.g. /Users/..., /home/..., C:\\...) do NOT exist inside the
+sandbox. Code running here can only access sandbox-local paths (like /workspace).
+To save outputs, write to a sandbox-local path (e.g. /workspace/output.pt) and
+then use sandbox_download_file to retrieve them.
+
+Use sandbox_write_file or sandbox_upload_file to get files IN, sandbox_list_files
+to discover them, and sandbox_download_file to get files OUT. Check data_mounts
+in sandbox_get_status for pre-mounted datasets. No internet by default; set
+network=true or call sandbox_enable_network first.
+
+Commands run without a timeout — long-running processes (training, etc.) are
+fully supported. Output is streamed back in real time.
 
 - command: Shell command (e.g. "python train.py --data-dir /data")
-- timeout: Max seconds (default 120, max 3600)
 - network: Temporarily enable internet for this command (default false)""",
 )
 async def sandbox_run_code(
     command: str | None = None,
-    timeout: int = 120,
     network: bool = False,
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     if not command:
         return json.dumps({"status": "error", "error": "No command specified"}, indent=2)
-
-    clamped_timeout = min(timeout, MAX_TIMEOUT)
 
     # Queue for streaming output lines from the worker thread to the async loop.
     line_queue: queue.Queue[str | None] = queue.Queue()
@@ -796,7 +857,7 @@ async def sandbox_run_code(
                 exit_code, stdout, stderr = _manager.exec_in_container_streaming(
                     container_info.container_id,
                     command,
-                    timeout=clamped_timeout,
+                    timeout=None,
                     on_output=_on_output,
                 )
 
@@ -813,6 +874,7 @@ async def sandbox_run_code(
 
                 result_payload: dict[str, Any] = {
                     "status": status,
+                    "session_id": sid,
                     "stdout": stdout[-MAX_OUTPUT_BYTES:],
                     "stderr": stderr[-MAX_OUTPUT_BYTES:],
                     "returncode": exit_code,
@@ -890,12 +952,18 @@ async def sandbox_run_code(
     description="""Write content to a file in the sandbox. Parent directories are created automatically.
 Relative paths resolve from /workspace (e.g. "src/main.py" → /workspace/src/main.py).
 
+IMPORTANT: When writing scripts that save output files, use sandbox-local paths
+(e.g. /workspace/model.pt), NOT host paths. The sandbox cannot access the host
+filesystem. Use sandbox_download_file afterwards to retrieve saved files.
+
 - path: Destination path in the sandbox
-- content: Full file content to write""",
+- content: Full file content to write (text, or base64-encoded binary when encoding="base64")
+- encoding: "utf-8" (default, plain text) or "base64" (for binary files like images, archives, model weights)""",
 )
 async def sandbox_write_file(
     path: str | None = None,
     content: str | None = None,
+    encoding: str = "utf-8",
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
@@ -903,6 +971,8 @@ async def sandbox_write_file(
         return json.dumps({"status": "error", "error": "No path specified"}, indent=2)
     if content is None:
         return json.dumps({"status": "error", "error": "No content specified"}, indent=2)
+    if encoding not in ("utf-8", "base64"):
+        return json.dumps({"status": "error", "error": "encoding must be 'utf-8' or 'base64'"}, indent=2)
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
@@ -920,47 +990,121 @@ async def sandbox_write_file(
             # Ensure parent directory exists
             parent_dir = os.path.dirname(container_path)
             if parent_dir and parent_dir != "/":
-                _manager.exec_in_container(
+                mkdir_code, mkdir_out = _manager.exec_in_container(
                     container_info.container_id,
                     f"mkdir -p '{parent_dir}'",
                     timeout=10,
                 )
+                if mkdir_code != 0:
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": f"Failed to create directory '{parent_dir}': {mkdir_out.strip()}",
+                        },
+                        indent=2,
+                    )
 
             # Write content via stdin using docker exec + sh -c "cat > file"
-            cmd = [
-                "docker",
-                "exec",
-                "-i",
-                "-w",
-                "/workspace",
+            # For base64 encoding, decode to binary and use docker cp instead
+            if encoding == "base64":
+                try:
+                    raw = base64.b64decode(content)
+                except Exception as e:
+                    return json.dumps(
+                        {"status": "error", "error": f"Invalid base64 content: {e}"},
+                        indent=2,
+                    )
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = os.path.join(tmpdir, os.path.basename(container_path))
+                    with open(tmp_path, "wb") as f:
+                        f.write(raw)
+
+                    result = subprocess.run(
+                        ["docker", "cp", tmp_path, f"{container_info.container_id}:{container_path}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if result.returncode != 0:
+                        return json.dumps(
+                            {
+                                "status": "error",
+                                "error": f"Failed to write file: {result.stderr.strip()}",
+                            },
+                            indent=2,
+                        )
+
+                expected_bytes = len(raw)
+            else:
+                cmd = [
+                    "docker",
+                    "exec",
+                    "-i",
+                    "-w",
+                    "/workspace",
+                    container_info.container_id,
+                    "sh",
+                    "-c",
+                    f"cat > '{container_path}'",
+                ]
+                result = subprocess.run(
+                    cmd,
+                    input=content,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode != 0:
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": f"Failed to write file: {result.stderr.strip()}",
+                        },
+                        indent=2,
+                    )
+
+                expected_bytes = len(content.encode())
+
+            # Verify the file was actually written with correct size
+            verify_code, verify_out = _manager.exec_in_container(
                 container_info.container_id,
-                "sh",
-                "-c",
-                f"cat > '{container_path}'",
-            ]
-            result = subprocess.run(
-                cmd,
-                input=content,
-                capture_output=True,
-                text=True,
-                timeout=30,
+                f"test -f '{container_path}' && stat -c '%s' '{container_path}'",
+                timeout=10,
             )
-            if result.returncode != 0:
+            if verify_code != 0:
                 return json.dumps(
                     {
                         "status": "error",
-                        "error": f"Failed to write file: {result.stderr.strip()}",
+                        "error": f"Write appeared to succeed but file not found at {container_path}",
                     },
                     indent=2,
                 )
 
-            size_bytes = len(content.encode())
+            try:
+                actual_bytes = int(verify_out.strip())
+            except (ValueError, TypeError):
+                actual_bytes = -1
+
+            if actual_bytes != expected_bytes:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            f"Write verification failed: expected {expected_bytes} bytes "
+                            f"but file has {actual_bytes} bytes at {container_path}"
+                        ),
+                    },
+                    indent=2,
+                )
 
             return json.dumps(
                 {
                     "status": "ok",
+                    "session_id": sid,
                     "path": container_path,
-                    "size_bytes": size_bytes,
+                    "size_bytes": expected_bytes,
+                    "verified": True,
                 },
                 indent=2,
             )
@@ -1026,6 +1170,7 @@ async def sandbox_list_files(
             return json.dumps(
                 {
                     "status": "ok",
+                    "session_id": sid,
                     "path": path,
                     "files": files,
                     "count": len(files),
@@ -1149,6 +1294,7 @@ async def sandbox_get_status(
             return json.dumps(
                 {
                     "status": "running",
+                    "session_id": sid,
                     "python_version": python_version,
                     "installed_packages": package_names,
                     "disk_usage_mb": disk_usage_mb,
@@ -1187,7 +1333,7 @@ async def sandbox_enable_network(
             if success:
                 container_info.network_enabled = True
                 return json.dumps(
-                    {"status": "ok", "network_enabled": True},
+                    {"status": "ok", "session_id": sid, "network_enabled": True},
                     indent=2,
                 )
             return json.dumps(
@@ -1224,7 +1370,7 @@ async def sandbox_disable_network(
             if success:
                 container_info.network_enabled = False
                 return json.dumps(
-                    {"status": "ok", "network_enabled": False},
+                    {"status": "ok", "session_id": sid, "network_enabled": False},
                     indent=2,
                 )
             return json.dumps(
@@ -1245,21 +1391,37 @@ async def sandbox_disable_network(
 
 @mcp.tool(
     title="Download File from Sandbox",
-    description="""Copy a file from the sandbox to the host filesystem.
+    description="""Copy a file OUT of the sandbox to the server filesystem, or return contents as base64.
+
+Use this to retrieve files produced by sandbox_run_code (e.g. model checkpoints,
+plots, logs). The sandbox filesystem is isolated — this is the only way to get
+files out.
+
+When the agent is on a different machine from the server, use inline=true to get
+the file content returned directly. The agent can then write it to its own
+filesystem using its file-writing tools.
+
+If dest looks like a remote agent path (e.g. /Users/..., C:\\...), the file is
+saved to the server's data directory instead. For small files (<256 KB), the
+content is also included inline in the response so the agent can write it locally.
+For large files, only the server path is returned.
 
 - path: Path in sandbox (relative to /workspace or absolute)
-- dest: Absolute destination path on host""",
+- dest: Destination path on the SERVER filesystem (default: server sandbox data dir).
+- inline: If true, return file contents directly instead of saving to server disk.
+- format: "base64" (default) or "text". Controls encoding of inline content.
+  Use "text" for source code, logs, CSVs. Use "base64" for binary files.""",
 )
 async def sandbox_download_file(
     path: str | None = None,
     dest: str | None = None,
+    inline: bool = False,
+    format: str = "base64",
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     if not path:
         return json.dumps({"status": "error", "error": "No path specified"}, indent=2)
-    if not dest:
-        return json.dumps({"status": "error", "error": "No dest specified"}, indent=2)
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
@@ -1274,8 +1436,86 @@ async def sandbox_download_file(
             else:
                 container_path = path
 
+            # Detect remote agent paths that don't exist on this server
+            is_remote_dest = dest and (
+                dest.startswith("/Users/")
+                or dest.startswith("C:\\")
+                or dest.startswith("C:/")
+            )
+
+            # --- explicit inline mode: return file content directly ---
+            if inline:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_dest = os.path.join(tmpdir, os.path.basename(container_path))
+                    result = subprocess.run(
+                        [
+                            "docker",
+                            "cp",
+                            f"{container_info.container_id}:{container_path}",
+                            tmp_dest,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if result.returncode != 0:
+                        return json.dumps(
+                            {
+                                "status": "error",
+                                "error": f"docker cp failed: {result.stderr.strip()}",
+                            },
+                            indent=2,
+                        )
+
+                    file_size = os.path.getsize(tmp_dest)
+                    max_inline = 50 * 1024 * 1024  # 50 MB
+                    if file_size > max_inline:
+                        return json.dumps(
+                            {
+                                "status": "error",
+                                "error": (
+                                    f"File is too large for inline download ({file_size:,} bytes, "
+                                    f"limit {max_inline:,}). Use inline=false with a server-local "
+                                    "dest path to save to disk instead."
+                                ),
+                            },
+                            indent=2,
+                        )
+
+                    resp: dict[str, Any] = {
+                        "status": "ok",
+                        "session_id": sid,
+                        "filename": os.path.basename(container_path),
+                        "size_bytes": file_size,
+                    }
+
+                    if format == "text":
+                        with open(tmp_dest, "r", encoding="utf-8", errors="replace") as f:
+                            resp["encoding"] = "utf-8"
+                            resp["content"] = f.read()
+                    else:
+                        with open(tmp_dest, "rb") as f:
+                            resp["encoding"] = "base64"
+                            resp["data"] = base64.b64encode(f.read()).decode("ascii")
+
+                    return json.dumps(resp, indent=2)
+
+            # --- disk mode: save to server filesystem ---
+            # When dest is a remote agent path, save to server data dir instead
+            resolved_dest = dest
+            dest_note = None
+
+            if is_remote_dest:
+                resolved_dest = None  # fall through to data dir default
+
+            if not resolved_dest:
+                dl_filename = os.path.basename(container_path)
+                downloads_dir = os.path.join(data_path, "downloads")
+                os.makedirs(downloads_dir, exist_ok=True)
+                resolved_dest = os.path.join(downloads_dir, dl_filename)
+
             # Ensure destination directory exists on the host
-            os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(resolved_dest)), exist_ok=True)
 
             # Use docker cp to copy the file out (fails with clear error if missing)
             result = subprocess.run(
@@ -1283,7 +1523,7 @@ async def sandbox_download_file(
                     "docker",
                     "cp",
                     f"{container_info.container_id}:{container_path}",
-                    dest,
+                    resolved_dest,
                 ],
                 capture_output=True,
                 text=True,
@@ -1299,18 +1539,47 @@ async def sandbox_download_file(
                 )
 
             try:
-                size_bytes = os.path.getsize(dest)
+                size_bytes = os.path.getsize(resolved_dest)
             except OSError:
                 size_bytes = None
 
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "dest": dest,
-                    "size_bytes": size_bytes,
-                },
-                indent=2,
-            )
+            resp: dict[str, Any] = {
+                "status": "ok",
+                "session_id": sid,
+                "dest": resolved_dest,
+                "size_bytes": size_bytes,
+            }
+
+            # For remote dest: also include inline content if the file is small
+            # enough for the agent to handle (< 256 KB)
+            if is_remote_dest:
+                max_auto_inline = 256 * 1024  # 256 KB
+                if size_bytes is not None and size_bytes <= max_auto_inline:
+                    if format == "text":
+                        with open(resolved_dest, "r", encoding="utf-8", errors="replace") as f:
+                            resp["encoding"] = "utf-8"
+                            resp["content"] = f.read()
+                    else:
+                        with open(resolved_dest, "rb") as f:
+                            resp["encoding"] = "base64"
+                            resp["data"] = base64.b64encode(f.read()).decode("ascii")
+                    dest_note = (
+                        f"dest '{dest}' is not on this server. File saved to "
+                        f"'{resolved_dest}' on the server. Content also included "
+                        "inline above — write it to the agent's filesystem."
+                    )
+                else:
+                    dest_note = (
+                        f"dest '{dest}' is not on this server. File saved to "
+                        f"'{resolved_dest}' on the server. The file is too large "
+                        f"({size_bytes:,} bytes) to return inline. Use "
+                        "sandbox_download_file with inline=true if you need the "
+                        "raw content, or access it on the server directly."
+                    )
+
+            if dest_note:
+                resp["note"] = dest_note
+            return json.dumps(resp, indent=2)
 
         except DockerNotAvailableError:
             return json.dumps(
@@ -1334,21 +1603,43 @@ async def sandbox_download_file(
 
 @mcp.tool(
     title="Upload File to Sandbox",
-    description="""Copy a file or directory from the host into the sandbox.
-src must be a path on the SERVER filesystem, not the agent's machine.
-For inline content, use sandbox_write_file instead.
+    description="""Copy a file or directory into the sandbox.
 
-- src: Absolute path on the server (file or directory)
+The sandbox is an isolated container — it cannot access the host/agent filesystem
+directly. Use this tool to transfer files INTO the sandbox before running code
+that needs them.
+
+Three modes:
+1. **Host path**: set `src` to an absolute path on the MCP SERVER filesystem.
+   NOTE: This must be a path on the server running the sandbox, not on the agent's machine.
+2. **Inline base64**: set `data` to base64-encoded content and `filename`.
+   Use for binary files (images, model weights, archives).
+3. **Plain text**: set `content` to UTF-8 text and `filename`.
+   Preferred for source code, configs, CSVs — no base64 encoding needed.
+   The agent can read a file from its own filesystem and pass the text directly.
+
+- src: Absolute server path (file or directory). Mutually exclusive with data/content.
+- data: Base64-encoded file content. Mutually exclusive with src/content.
+- content: Plain UTF-8 text content. Mutually exclusive with src/data.
+- filename: Required when using data or content (ignored when using src).
 - dest: Destination in sandbox (relative to /workspace or absolute; defaults to /workspace/<filename>)""",
 )
 async def sandbox_upload_file(
     src: str | None = None,
+    data: str | None = None,
+    content: str | None = None,
+    filename: str | None = None,
     dest: str | None = None,
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
-    if not src:
-        return json.dumps({"status": "error", "error": "No src specified"}, indent=2)
+    modes_set = sum(x is not None for x in (src, data, content))
+    if modes_set == 0:
+        return json.dumps({"status": "error", "error": "Provide one of: src, data, or content"}, indent=2)
+    if modes_set > 1:
+        return json.dumps({"status": "error", "error": "Provide only one of: src, data, or content"}, indent=2)
+    if (data is not None or content is not None) and not filename:
+        return json.dumps({"status": "error", "error": "filename is required when using data or content"}, indent=2)
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
@@ -1357,6 +1648,115 @@ async def sandbox_upload_file(
         try:
             container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
 
+            # --- Inline data mode: decode base64 to temp file, then docker cp ---
+            if data is not None:
+                try:
+                    raw = base64.b64decode(data)
+                except Exception as e:
+                    return json.dumps(
+                        {"status": "error", "error": f"Invalid base64 data: {e}"},
+                        indent=2,
+                    )
+
+                # Determine destination inside the container
+                if dest:
+                    container_dest = dest if dest.startswith("/") else f"/workspace/{dest}"
+                else:
+                    container_dest = f"/workspace/{filename}"
+
+                # Ensure parent directory exists in container
+                parent_dir = os.path.dirname(container_dest)
+                if parent_dir and parent_dir != "/":
+                    _manager.exec_in_container(
+                        container_info.container_id,
+                        f"mkdir -p '{parent_dir}'",
+                        timeout=10,
+                    )
+
+                # Write decoded content to a temp file, then docker cp it in
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = os.path.join(tmpdir, filename)
+                    with open(tmp_path, "wb") as f:
+                        f.write(raw)
+
+                    result = subprocess.run(
+                        ["docker", "cp", tmp_path, f"{container_info.container_id}:{container_dest}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if result.returncode != 0:
+                        return json.dumps(
+                            {
+                                "status": "error",
+                                "error": f"docker cp failed: {result.stderr.strip()}",
+                            },
+                            indent=2,
+                        )
+
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "session_id": sid,
+                        "mode": "inline",
+                        "dest": container_dest,
+                        "size_bytes": len(raw),
+                    },
+                    indent=2,
+                )
+
+            # --- Plain text content mode: write UTF-8 text, then docker cp ---
+            if content is not None:
+                raw = content.encode("utf-8")
+
+                # Determine destination inside the container
+                if dest:
+                    container_dest = dest if dest.startswith("/") else f"/workspace/{dest}"
+                else:
+                    container_dest = f"/workspace/{filename}"
+
+                # Ensure parent directory exists in container
+                parent_dir = os.path.dirname(container_dest)
+                if parent_dir and parent_dir != "/":
+                    _manager.exec_in_container(
+                        container_info.container_id,
+                        f"mkdir -p '{parent_dir}'",
+                        timeout=10,
+                    )
+
+                # Write content to a temp file, then docker cp it in
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = os.path.join(tmpdir, filename)
+                    with open(tmp_path, "wb") as f:
+                        f.write(raw)
+
+                    result = subprocess.run(
+                        ["docker", "cp", tmp_path, f"{container_info.container_id}:{container_dest}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if result.returncode != 0:
+                        return json.dumps(
+                            {
+                                "status": "error",
+                                "error": f"docker cp failed: {result.stderr.strip()}",
+                            },
+                            indent=2,
+                        )
+
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "session_id": sid,
+                        "mode": "content",
+                        "dest": container_dest,
+                        "size_bytes": len(raw),
+                    },
+                    indent=2,
+                )
+
+            # --- Host path mode: copy from server filesystem ---
             abs_src = os.path.abspath(src)
             if not os.path.exists(abs_src):
                 hint = ""
@@ -1365,7 +1765,7 @@ async def sandbox_upload_file(
                     hint = (
                         " This looks like a path from a different machine. "
                         "src must be a path on the server's filesystem. "
-                        "Use sandbox_write_file with inline content for remote files."
+                        "Use data parameter with base64 content for remote files."
                     )
                 return json.dumps(
                     {
@@ -1426,6 +1826,8 @@ async def sandbox_upload_file(
             return json.dumps(
                 {
                     "status": "ok",
+                    "session_id": sid,
+                    "mode": "host_path",
                     "dest": container_dest,
                     "size_bytes": size_bytes,
                 },
@@ -1526,6 +1928,7 @@ async def sandbox_read_file(
             return json.dumps(
                 {
                     "status": "ok",
+                    "session_id": sid,
                     "content": content,
                     "size_bytes": total_size,
                     "offset": offset,
