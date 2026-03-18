@@ -18,9 +18,9 @@ from onit_sandbox.mcp_server import (
     sandbox_disable_network,
     sandbox_download_file,
     sandbox_enable_network,
+    sandbox_get_status,
     sandbox_install_packages,
     sandbox_run_code,
-    sandbox_get_status,
 )
 
 

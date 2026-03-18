@@ -39,9 +39,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Annotated, Any, Literal, TypeVar, overload
 
-from pydantic import Field
-
 from mcp.server.fastmcp import Context
+from pydantic import Field
 
 from onit_sandbox.server import (
     DEFAULT_CPU_QUOTA,
@@ -963,7 +962,8 @@ async def sandbox_run_code(
 
 @mcp.tool(
     title="Write File to Sandbox",
-    description="""Write content to a file in the sandbox. Parent directories are created automatically.
+    description="""Write content to a file in the sandbox.
+Parent directories are created automatically.
 Relative paths resolve from /workspace.
 
 - path: Destination path in the sandbox (relative to /workspace or absolute).
@@ -1020,7 +1020,8 @@ async def sandbox_write_file(
                     return json.dumps(
                         {
                             "status": "error",
-                            "error": f"Failed to create directory '{parent_dir}': {mkdir_out.strip()}",
+                            "error": f"Failed to create directory "
+                            f"'{parent_dir}': {mkdir_out.strip()}",
                         },
                         indent=2,
                     )
@@ -1102,7 +1103,8 @@ async def sandbox_write_file(
                 return json.dumps(
                     {
                         "status": "error",
-                        "error": f"Write appeared to succeed but file not found at {container_path}",
+                        "error": f"Write appeared to succeed but "
+                        f"file not found at {container_path}",
                     },
                     indent=2,
                 )
@@ -1152,7 +1154,8 @@ async def sandbox_write_file(
 
 @mcp.tool(
     title="List Files in Sandbox",
-    description="""List files in the sandbox. Use absolute paths to explore data mounts (e.g. "/data").
+    description="""List files in the sandbox.
+Use absolute paths to explore data mounts (e.g. "/data").
 
 - path: Directory to list, relative to /workspace or absolute (default ".")
 - max_depth: Recursion depth 1-10 (default 3)""",
@@ -1229,7 +1232,8 @@ async def sandbox_list_files(
 
 @mcp.tool(
     title="Sandbox Status",
-    description="""Returns sandbox state, installed packages, GPU availability, and data_mounts (pre-mounted host directories).""",
+    description="""Returns sandbox state, installed packages,
+GPU availability, and data_mounts (pre-mounted host directories).""",
 )
 async def sandbox_get_status(
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
@@ -1344,7 +1348,8 @@ async def sandbox_get_status(
 
 @mcp.tool(
     title="Enable Network",
-    description="""Enable persistent internet access. Stays on until sandbox_disable_network is called.""",
+    description="""Enable persistent internet access.
+Stays on until sandbox_disable_network is called.""",
 )
 async def sandbox_enable_network(
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
@@ -1520,13 +1525,15 @@ async def sandbox_download_file(
 
 @mcp.tool(
     title="Upload File to Sandbox",
-    description="""Copy a file or directory into the sandbox. Provide exactly one of src, data, or content.
+    description="""Copy a file or directory into the sandbox.
+Provide exactly one of src, data, or content.
 
 - src: Absolute server path to copy from.
 - data: Base64-encoded file content (requires filename).
 - content: Plain UTF-8 text content (requires filename).
 - filename: Name for the file when using data or content.
-- dest: Destination in sandbox (relative to /workspace or absolute; default: /workspace/<filename>).""",
+- dest: Destination in sandbox (relative or absolute;
+  default: /workspace/<filename>).""",
 )
 async def sandbox_upload_file(
     src: Annotated[str | None, Field(description="Absolute server path to copy from.")] = None,
@@ -1789,7 +1796,8 @@ async def sandbox_upload_file(
 
 @mcp.tool(
     title="Read File from Sandbox",
-    description="""Read file contents from the sandbox. For large binary files, use sandbox_download_file.
+    description="""Read file contents from the sandbox.
+For large binary files, use sandbox_download_file.
 
 - path: Path in sandbox (relative to /workspace or absolute)
 - max_bytes: Max bytes to read (default 100000, cap 1MB)
