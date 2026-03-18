@@ -1580,6 +1580,7 @@ async def sandbox_upload_file(
 
             # --- Inline data mode: decode base64 to temp file, then docker cp ---
             if data is not None:
+                assert filename is not None
                 try:
                     raw = base64.b64decode(data)
                 except Exception as e:
@@ -1642,6 +1643,7 @@ async def sandbox_upload_file(
 
             # --- Plain text content mode: write UTF-8 text, then docker cp ---
             if content is not None:
+                assert filename is not None
                 raw = content.encode("utf-8")
 
                 # Determine destination inside the container
@@ -1697,6 +1699,7 @@ async def sandbox_upload_file(
                 )
 
             # --- Host path mode: copy from server filesystem ---
+            assert src is not None
             abs_src = os.path.abspath(src)
 
             if not os.path.exists(abs_src):
