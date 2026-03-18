@@ -1381,6 +1381,7 @@ async def sandbox_download_file(
     path: Annotated[str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")] = None,
     dest: Annotated[str | None, Field(description="Absolute path to save the file to. Required — the file is copied from the sandbox directly to this location.")] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    data_path: Annotated[str | None, Field(description="Agent data directory to save to.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not path:
@@ -1390,7 +1391,7 @@ async def sandbox_download_file(
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
-        session_data_path = _get_data_path(sid)
+        session_data_path = data_path if data_path else _get_data_path(sid)
 
         try:
             container_info = _manager.get_or_create_container(sid, session_data_path, extra_mounts=DATA_MOUNTS)
@@ -1403,13 +1404,13 @@ async def sandbox_download_file(
 
             dl_filename = os.path.basename(container_path)
 
-            # Resolve destination path
+            # Resolve destination path — use data_path as base when provided
             if dest.startswith("/"):
                 resolved_dest = dest
             else:
-                downloads_dir = os.path.join(session_data_path, "downloads")
-                os.makedirs(downloads_dir, exist_ok=True)
-                resolved_dest = os.path.join(downloads_dir, dest)
+                dl_dir = session_data_path
+                os.makedirs(dl_dir, exist_ok=True)
+                resolved_dest = os.path.join(dl_dir, dest or dl_filename)
 
             # Ensure destination directory exists
             os.makedirs(os.path.dirname(os.path.abspath(resolved_dest)), exist_ok=True)
@@ -1486,6 +1487,7 @@ async def sandbox_upload_file(
     filename: Annotated[str | None, Field(description="Name for the file when using data or content.")] = None,
     dest: Annotated[str | None, Field(description="Destination in sandbox (relative to /workspace or absolute).")] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    data_path: Annotated[str | None, Field(description="Agent data directory.")] = None,
     ctx: Context | None = None,
 ) -> str:
     modes_set = sum(x is not None for x in (src, data, content))
@@ -1498,7 +1500,7 @@ async def sandbox_upload_file(
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
-        session_data_path = _get_data_path(sid)
+        session_data_path = data_path if data_path else _get_data_path(sid)
 
         try:
             container_info = _manager.get_or_create_container(sid, session_data_path, extra_mounts=DATA_MOUNTS)
