@@ -829,7 +829,8 @@ paths (e.g. /workspace) are accessible — host paths do not exist here.
 No internet by default. Output is streamed in real time.
 
 - command: Shell command to run (e.g. "python train.py --data-dir /data").
-- network: Temporarily enable internet for this command (default false).""",
+- network: Temporarily enable internet for this command (default false).
+- timeout: Max seconds before the command is killed (default: no limit).""",
 )
 async def sandbox_run_code(
     command: Annotated[
@@ -838,6 +839,10 @@ async def sandbox_run_code(
     network: Annotated[
         bool, Field(description="Temporarily enable internet for this command.")
     ] = False,
+    timeout: Annotated[
+        int | None,
+        Field(description="Max seconds before the command is killed (default: no limit)."),
+    ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
@@ -872,7 +877,7 @@ async def sandbox_run_code(
                 exit_code, stdout, stderr = _manager.exec_in_container_streaming(
                     container_info.container_id,
                     command,
-                    timeout=None,
+                    timeout=timeout,
                     on_output=_on_output,
                 )
 
@@ -882,6 +887,8 @@ async def sandbox_run_code(
 
                 if exit_code == 0:
                     status = "ok"
+                elif "timed out" in stderr:
+                    status = "timeout"
                 else:
                     status = "error"
 
