@@ -37,7 +37,9 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, TypeVar, overload
+from typing import Annotated, Any, Literal, TypeVar, overload
+
+from pydantic import Field
 
 from mcp.server.fastmcp import Context
 
@@ -723,11 +725,11 @@ async def _run_with_progress(
     title="Install Python Packages",
     description="""Install Python packages via pip. Network is enabled automatically during install.
 
-- packages: Space-separated, e.g. "numpy matplotlib scipy==1.12.0\"""",
+- packages: Space-separated package names, e.g. "numpy matplotlib scipy==1.12.0".""",
 )
 async def sandbox_install_packages(
-    packages: str | None = None,
-    session_id: str | None = None,
+    packages: Annotated[str | None, Field(description="Space-separated package names, e.g. 'numpy matplotlib scipy==1.12.0'.")] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not packages:
@@ -803,29 +805,17 @@ async def sandbox_install_packages(
 
 @mcp.tool(
     title="Run Code",
-    description="""Execute a shell command in the sandbox.
+    description="""Execute a shell command in the isolated sandbox container. Only sandbox-local
+paths (e.g. /workspace) are accessible — host paths do not exist here.
+No internet by default. Output is streamed in real time.
 
-IMPORTANT: The sandbox is an isolated Docker container with its OWN filesystem.
-Host/agent paths (e.g. /Users/..., /home/..., C:\\...) do NOT exist inside the
-sandbox. Code running here can only access sandbox-local paths (like /workspace).
-To save outputs, write to a sandbox-local path (e.g. /workspace/output.pt) and
-then use sandbox_download_file to retrieve them.
-
-Use sandbox_write_file or sandbox_upload_file to get files IN, sandbox_list_files
-to discover them, and sandbox_download_file to get files OUT. Check data_mounts
-in sandbox_get_status for pre-mounted datasets. No internet by default; set
-network=true or call sandbox_enable_network first.
-
-Commands run without a timeout — long-running processes (training, etc.) are
-fully supported. Output is streamed back in real time.
-
-- command: Shell command (e.g. "python train.py --data-dir /data")
-- network: Temporarily enable internet for this command (default false)""",
+- command: Shell command to run (e.g. "python train.py --data-dir /data").
+- network: Temporarily enable internet for this command (default false).""",
 )
 async def sandbox_run_code(
-    command: str | None = None,
-    network: bool = False,
-    session_id: str | None = None,
+    command: Annotated[str | None, Field(description="Shell command to execute, e.g. 'python train.py'.")] = None,
+    network: Annotated[bool, Field(description="Temporarily enable internet for this command.")] = False,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not command:
@@ -865,9 +855,7 @@ async def sandbox_run_code(
                 files_after = _list_workspace_files(container_info.container_id)
                 files_created = sorted(files_after - files_before)
 
-                if exit_code == -1 and "timed out" in stderr:
-                    status = "timeout"
-                elif exit_code == 0:
+                if exit_code == 0:
                     status = "ok"
                 else:
                     status = "error"
@@ -950,21 +938,17 @@ async def sandbox_run_code(
 @mcp.tool(
     title="Write File to Sandbox",
     description="""Write content to a file in the sandbox. Parent directories are created automatically.
-Relative paths resolve from /workspace (e.g. "src/main.py" → /workspace/src/main.py).
+Relative paths resolve from /workspace.
 
-IMPORTANT: When writing scripts that save output files, use sandbox-local paths
-(e.g. /workspace/model.pt), NOT host paths. The sandbox cannot access the host
-filesystem. Use sandbox_download_file afterwards to retrieve saved files.
-
-- path: Destination path in the sandbox
-- content: Full file content to write (text, or base64-encoded binary when encoding="base64")
-- encoding: "utf-8" (default, plain text) or "base64" (for binary files like images, archives, model weights)""",
+- path: Destination path in the sandbox (relative to /workspace or absolute).
+- content: File content (text, or base64 when encoding="base64").
+- encoding: "utf-8" (default) or "base64" for binary files.""",
 )
 async def sandbox_write_file(
-    path: str | None = None,
-    content: str | None = None,
-    encoding: str = "utf-8",
-    session_id: str | None = None,
+    path: Annotated[str | None, Field(description="Destination path in the sandbox (relative to /workspace or absolute).")] = None,
+    content: Annotated[str | None, Field(description="File content (text, or base64 when encoding='base64').")] = None,
+    encoding: Annotated[str, Field(description="'utf-8' (default) or 'base64' for binary files.")] = "utf-8",
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not path:
@@ -1132,9 +1116,9 @@ async def sandbox_write_file(
 - max_depth: Recursion depth 1-10 (default 3)""",
 )
 async def sandbox_list_files(
-    path: str = ".",
-    max_depth: int = 3,
-    session_id: str | None = None,
+    path: Annotated[str, Field(description="Directory to list (relative to /workspace or absolute).")] = ".",
+    max_depth: Annotated[int, Field(description="Recursion depth, 1-10.")] = 3,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
@@ -1199,12 +1183,10 @@ async def sandbox_list_files(
 
 @mcp.tool(
     title="Sandbox Status",
-    description="""Call this FIRST. Returns sandbox state, installed packages, GPU availability,
-and data_mounts — host directories already mounted into the sandbox.
-Check data_mounts before downloading or uploading data.""",
+    description="""Returns sandbox state, installed packages, GPU availability, and data_mounts (pre-mounted host directories).""",
 )
 async def sandbox_get_status(
-    session_id: str | None = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
@@ -1316,11 +1298,10 @@ async def sandbox_get_status(
 
 @mcp.tool(
     title="Enable Network",
-    description="""Enable persistent internet access. Stays enabled until sandbox_disable_network is called.
-Check data_mounts first — datasets may already be mounted locally.""",
+    description="""Enable persistent internet access. Stays on until sandbox_disable_network is called.""",
 )
 async def sandbox_enable_network(
-    session_id: str | None = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
@@ -1357,7 +1338,7 @@ async def sandbox_enable_network(
     description="Disable internet access, restoring network isolation.",
 )
 async def sandbox_disable_network(
-    session_id: str | None = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
@@ -1391,44 +1372,28 @@ async def sandbox_disable_network(
 
 @mcp.tool(
     title="Download File from Sandbox",
-    description="""Copy a file OUT of the sandbox to the server filesystem, or return contents as base64.
+    description="""Copy a file from the sandbox to the server filesystem.
 
-Use this to retrieve files produced by sandbox_run_code (e.g. model checkpoints,
-plots, logs). The sandbox filesystem is isolated — this is the only way to get
-files out.
-
-When the agent is on a different machine from the server, use inline=true to get
-the file content returned directly. The agent can then write it to its own
-filesystem using its file-writing tools.
-
-If dest looks like a remote agent path (e.g. /Users/..., C:\\...), the file is
-saved to the server's data directory instead. For small files (<256 KB), the
-content is also included inline in the response so the agent can write it locally.
-For large files, only the server path is returned.
-
-- path: Path in sandbox (relative to /workspace or absolute)
-- dest: Destination path on the SERVER filesystem (default: server sandbox data dir).
-- inline: If true, return file contents directly instead of saving to server disk.
-- format: "base64" (default) or "text". Controls encoding of inline content.
-  Use "text" for source code, logs, CSVs. Use "base64" for binary files.""",
+- path: Path in sandbox (relative to /workspace or absolute).
+- dest: Absolute server path to save to (default: session downloads directory).""",
 )
 async def sandbox_download_file(
-    path: str | None = None,
-    dest: str | None = None,
-    inline: bool = False,
-    format: str = "base64",
-    session_id: str | None = None,
+    path: Annotated[str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")] = None,
+    dest: Annotated[str | None, Field(description="Absolute path to save the file to. Required — the file is copied from the sandbox directly to this location.")] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not path:
         return json.dumps({"status": "error", "error": "No path specified"}, indent=2)
+    if not dest:
+        return json.dumps({"status": "error", "error": "No dest specified"}, indent=2)
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
-        data_path = _get_data_path(sid)
+        session_data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(sid, session_data_path, extra_mounts=DATA_MOUNTS)
 
             # Normalise path to absolute
             if not path.startswith("/"):
@@ -1436,88 +1401,20 @@ async def sandbox_download_file(
             else:
                 container_path = path
 
-            # Detect remote agent paths that don't exist on this server
-            is_remote_dest = dest and (
-                dest.startswith("/Users/")
-                or dest.startswith("C:\\")
-                or dest.startswith("C:/")
-            )
+            dl_filename = os.path.basename(container_path)
 
-            # --- explicit inline mode: return file content directly ---
-            if inline:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    tmp_dest = os.path.join(tmpdir, os.path.basename(container_path))
-                    result = subprocess.run(
-                        [
-                            "docker",
-                            "cp",
-                            f"{container_info.container_id}:{container_path}",
-                            tmp_dest,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
-                    )
-                    if result.returncode != 0:
-                        return json.dumps(
-                            {
-                                "status": "error",
-                                "error": f"docker cp failed: {result.stderr.strip()}",
-                            },
-                            indent=2,
-                        )
-
-                    file_size = os.path.getsize(tmp_dest)
-                    max_inline = 50 * 1024 * 1024  # 50 MB
-                    if file_size > max_inline:
-                        return json.dumps(
-                            {
-                                "status": "error",
-                                "error": (
-                                    f"File is too large for inline download ({file_size:,} bytes, "
-                                    f"limit {max_inline:,}). Use inline=false with a server-local "
-                                    "dest path to save to disk instead."
-                                ),
-                            },
-                            indent=2,
-                        )
-
-                    resp: dict[str, Any] = {
-                        "status": "ok",
-                        "session_id": sid,
-                        "filename": os.path.basename(container_path),
-                        "size_bytes": file_size,
-                    }
-
-                    if format == "text":
-                        with open(tmp_dest, "r", encoding="utf-8", errors="replace") as f:
-                            resp["encoding"] = "utf-8"
-                            resp["content"] = f.read()
-                    else:
-                        with open(tmp_dest, "rb") as f:
-                            resp["encoding"] = "base64"
-                            resp["data"] = base64.b64encode(f.read()).decode("ascii")
-
-                    return json.dumps(resp, indent=2)
-
-            # --- disk mode: save to server filesystem ---
-            # When dest is a remote agent path, save to server data dir instead
-            resolved_dest = dest
-            dest_note = None
-
-            if is_remote_dest:
-                resolved_dest = None  # fall through to data dir default
-
-            if not resolved_dest:
-                dl_filename = os.path.basename(container_path)
-                downloads_dir = os.path.join(data_path, "downloads")
+            # Resolve destination path
+            if dest.startswith("/"):
+                resolved_dest = dest
+            else:
+                downloads_dir = os.path.join(session_data_path, "downloads")
                 os.makedirs(downloads_dir, exist_ok=True)
-                resolved_dest = os.path.join(downloads_dir, dl_filename)
+                resolved_dest = os.path.join(downloads_dir, dest)
 
-            # Ensure destination directory exists on the host
+            # Ensure destination directory exists
             os.makedirs(os.path.dirname(os.path.abspath(resolved_dest)), exist_ok=True)
 
-            # Use docker cp to copy the file out (fails with clear error if missing)
+            # Use docker cp to copy file directly to destination
             result = subprocess.run(
                 [
                     "docker",
@@ -1546,39 +1443,10 @@ async def sandbox_download_file(
             resp: dict[str, Any] = {
                 "status": "ok",
                 "session_id": sid,
+                "filename": dl_filename,
                 "dest": resolved_dest,
                 "size_bytes": size_bytes,
             }
-
-            # For remote dest: also include inline content if the file is small
-            # enough for the agent to handle (< 256 KB)
-            if is_remote_dest:
-                max_auto_inline = 256 * 1024  # 256 KB
-                if size_bytes is not None and size_bytes <= max_auto_inline:
-                    if format == "text":
-                        with open(resolved_dest, "r", encoding="utf-8", errors="replace") as f:
-                            resp["encoding"] = "utf-8"
-                            resp["content"] = f.read()
-                    else:
-                        with open(resolved_dest, "rb") as f:
-                            resp["encoding"] = "base64"
-                            resp["data"] = base64.b64encode(f.read()).decode("ascii")
-                    dest_note = (
-                        f"dest '{dest}' is not on this server. File saved to "
-                        f"'{resolved_dest}' on the server. Content also included "
-                        "inline above — write it to the agent's filesystem."
-                    )
-                else:
-                    dest_note = (
-                        f"dest '{dest}' is not on this server. File saved to "
-                        f"'{resolved_dest}' on the server. The file is too large "
-                        f"({size_bytes:,} bytes) to return inline. Use "
-                        "sandbox_download_file with inline=true if you need the "
-                        "raw content, or access it on the server directly."
-                    )
-
-            if dest_note:
-                resp["note"] = dest_note
             return json.dumps(resp, indent=2)
 
         except DockerNotAvailableError:
@@ -1603,34 +1471,21 @@ async def sandbox_download_file(
 
 @mcp.tool(
     title="Upload File to Sandbox",
-    description="""Copy a file or directory into the sandbox.
+    description="""Copy a file or directory into the sandbox. Provide exactly one of src, data, or content.
 
-The sandbox is an isolated container — it cannot access the host/agent filesystem
-directly. Use this tool to transfer files INTO the sandbox before running code
-that needs them.
-
-Three modes:
-1. **Host path**: set `src` to an absolute path on the MCP SERVER filesystem.
-   NOTE: This must be a path on the server running the sandbox, not on the agent's machine.
-2. **Inline base64**: set `data` to base64-encoded content and `filename`.
-   Use for binary files (images, model weights, archives).
-3. **Plain text**: set `content` to UTF-8 text and `filename`.
-   Preferred for source code, configs, CSVs — no base64 encoding needed.
-   The agent can read a file from its own filesystem and pass the text directly.
-
-- src: Absolute server path (file or directory). Mutually exclusive with data/content.
-- data: Base64-encoded file content. Mutually exclusive with src/content.
-- content: Plain UTF-8 text content. Mutually exclusive with src/data.
-- filename: Required when using data or content (ignored when using src).
-- dest: Destination in sandbox (relative to /workspace or absolute; defaults to /workspace/<filename>)""",
+- src: Absolute server path to copy from.
+- data: Base64-encoded file content (requires filename).
+- content: Plain UTF-8 text content (requires filename).
+- filename: Name for the file when using data or content.
+- dest: Destination in sandbox (relative to /workspace or absolute; default: /workspace/<filename>).""",
 )
 async def sandbox_upload_file(
-    src: str | None = None,
-    data: str | None = None,
-    content: str | None = None,
-    filename: str | None = None,
-    dest: str | None = None,
-    session_id: str | None = None,
+    src: Annotated[str | None, Field(description="Absolute server path to copy from.")] = None,
+    data: Annotated[str | None, Field(description="Base64-encoded file content (requires filename).")] = None,
+    content: Annotated[str | None, Field(description="Plain UTF-8 text content (requires filename).")] = None,
+    filename: Annotated[str | None, Field(description="Name for the file when using data or content.")] = None,
+    dest: Annotated[str | None, Field(description="Destination in sandbox (relative to /workspace or absolute).")] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     modes_set = sum(x is not None for x in (src, data, content))
@@ -1643,10 +1498,10 @@ async def sandbox_upload_file(
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
-        data_path = _get_data_path(sid)
+        session_data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(sid, session_data_path, extra_mounts=DATA_MOUNTS)
 
             # --- Inline data mode: decode base64 to temp file, then docker cp ---
             if data is not None:
@@ -1758,14 +1613,15 @@ async def sandbox_upload_file(
 
             # --- Host path mode: copy from server filesystem ---
             abs_src = os.path.abspath(src)
+
             if not os.path.exists(abs_src):
                 hint = ""
                 # Detect common remote-path patterns
                 if src.startswith("/Users/") or src.startswith("C:\\"):
                     hint = (
                         " This looks like a path from a different machine. "
-                        "src must be a path on the server's filesystem. "
-                        "Use data parameter with base64 content for remote files."
+                        "src must be an absolute path on the server's filesystem. "
+                        "Use data or content parameters for remote files."
                     )
                 return json.dumps(
                     {
@@ -1823,16 +1679,15 @@ async def sandbox_upload_file(
                 except OSError:
                     size_bytes = None
 
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "session_id": sid,
-                    "mode": "host_path",
-                    "dest": container_dest,
-                    "size_bytes": size_bytes,
-                },
-                indent=2,
-            )
+            resp = {
+                "status": "ok",
+                "session_id": sid,
+                "mode": "host_path",
+                "src": abs_src,
+                "dest": container_dest,
+                "size_bytes": size_bytes,
+            }
+            return json.dumps(resp, indent=2)
 
         except DockerNotAvailableError:
             return json.dumps(
@@ -1863,10 +1718,10 @@ async def sandbox_upload_file(
 - offset: Byte offset to start from (default 0, useful for tailing logs)""",
 )
 async def sandbox_read_file(
-    path: str | None = None,
-    max_bytes: int = 100000,
-    offset: int = 0,
-    session_id: str | None = None,
+    path: Annotated[str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")] = None,
+    max_bytes: Annotated[int, Field(description="Max bytes to read (cap 1MB).")] = 100000,
+    offset: Annotated[int, Field(description="Byte offset to start from (useful for tailing logs).")] = 0,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not path:

@@ -89,15 +89,15 @@ class TestSandboxTools:
         data = json.loads(result)
         assert data["status"] == "error"
 
-    def test_sandbox_download_file_no_sandbox_path(self):
-        """Test sandbox_download_file with no sandbox_path specified."""
-        result = _run(sandbox_download_file(sandbox_path=None, dest_path="/tmp/out.txt"))
+    def test_sandbox_download_file_no_path(self):
+        """Test sandbox_download_file with no path specified."""
+        result = _run(sandbox_download_file(path=None, dest="/tmp/out.txt"))
         data = json.loads(result)
         assert data["status"] == "error"
 
-    def test_sandbox_download_file_no_dest_path(self):
-        """Test sandbox_download_file with no dest_path specified."""
-        result = _run(sandbox_download_file(sandbox_path="file.txt", dest_path=None))
+    def test_sandbox_download_file_no_dest(self):
+        """Test sandbox_download_file with no dest specified."""
+        result = _run(sandbox_download_file(path="file.txt", dest=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
@@ -198,12 +198,13 @@ class TestSandboxWithDocker:
 
         # Download it to a local path
         dest = str(tmp_path / "downloaded.txt")
-        result = _run(sandbox_download_file(sandbox_path="dl_test.txt", dest_path=dest))
+        result = _run(sandbox_download_file(path="dl_test.txt", dest=dest))
         data = json.loads(result)
 
         assert data["status"] == "ok"
-        assert data["sandbox_path"] == "dl_test.txt"
-        assert data["dest_path"] == dest
+        assert data["dest"] == dest
+        assert data["filename"] == "dl_test.txt"
+        assert data["size_bytes"] > 0
         assert os.path.isfile(dest)
         with open(dest) as f:
             assert "download test" in f.read()
@@ -216,7 +217,7 @@ class TestSandboxWithDocker:
         _run(sandbox_run_code(command="echo hello"))
 
         dest = str(tmp_path / "missing.txt")
-        result = _run(sandbox_download_file(sandbox_path="no_such_file.txt", dest_path=dest))
+        result = _run(sandbox_download_file(path="no_such_file.txt", dest=dest))
         data = json.loads(result)
 
         assert data["status"] == "error"
