@@ -79,9 +79,11 @@ def _run_foreground(args: argparse.Namespace) -> None:
 
     mounts = getattr(args, "mount", None) or []
 
-    print(f"Starting Sandbox MCP Server on "
-          f"{build_server_url(args.host, args.port, args.transport)} "
-          f"(transport: {args.transport})")
+    print(
+        f"Starting Sandbox MCP Server on "
+        f"{build_server_url(args.host, args.port, args.transport)} "
+        f"(transport: {args.transport})"
+    )
     if mounts:
         print(f"Data mounts: {', '.join(mounts)}")
 

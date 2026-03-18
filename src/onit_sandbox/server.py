@@ -73,7 +73,9 @@ def parse_data_mounts(raw: str | list[str]) -> list[dict[str, str]]:
                 os.makedirs(host_path, exist_ok=True)
             except OSError as exc:
                 logger.warning("Could not create mount path %s: %s", host_path, exc)
-        mounts.append({"host": os.path.abspath(host_path), "container": container_path, "mode": mode})
+        mounts.append(
+            {"host": os.path.abspath(host_path), "container": container_path, "mode": mode}
+        )
     return mounts
 
 

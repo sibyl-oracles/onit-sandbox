@@ -141,8 +141,17 @@ class SandboxManager:
 
             # Step 2: Verify an actual GPU is accessible
             result = subprocess.run(
-                ["docker", "run", "--rm", "--gpus", "all", "nvidia/cuda:12.0.0-base-ubuntu22.04",
-                 "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--gpus",
+                    "all",
+                    "nvidia/cuda:12.0.0-base-ubuntu22.04",
+                    "nvidia-smi",
+                    "--query-gpu=name",
+                    "--format=csv,noheader",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -249,10 +258,12 @@ class SandboxManager:
 
         # Add extra data volume mounts (e.g. /data:/data:ro)
         for mount in extra_mounts or []:
-            cmd.extend([
-                "--volume",
-                f"{mount['host']}:{mount['container']}:{mount['mode']}",
-            ])
+            cmd.extend(
+                [
+                    "--volume",
+                    f"{mount['host']}:{mount['container']}:{mount['mode']}",
+                ]
+            )
 
         if gpu_available:
             cmd.extend(["--gpus", "all"])
@@ -499,7 +510,11 @@ class SandboxManager:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         _cleanup_proc(proc, t_out, t_err)
-                        return -1, "".join(stdout_lines), f"Command timed out after {timeout} seconds"
+                        return (
+                            -1,
+                            "".join(stdout_lines),
+                            f"Command timed out after {timeout} seconds",
+                        )
                     wait_time = min(remaining, 1.0)
                 else:
                     wait_time = 1.0
@@ -728,7 +743,10 @@ async def _run_with_progress(
 - packages: Space-separated package names, e.g. "numpy matplotlib scipy==1.12.0".""",
 )
 async def sandbox_install_packages(
-    packages: Annotated[str | None, Field(description="Space-separated package names, e.g. 'numpy matplotlib scipy==1.12.0'.")] = None,
+    packages: Annotated[
+        str | None,
+        Field(description="Space-separated package names, e.g. 'numpy matplotlib scipy==1.12.0'."),
+    ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
@@ -740,7 +758,9 @@ async def sandbox_install_packages(
         data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
             if not _manager.enable_network(container_info.container_id):
                 return json.dumps(
                     {
@@ -813,8 +833,12 @@ No internet by default. Output is streamed in real time.
 - network: Temporarily enable internet for this command (default false).""",
 )
 async def sandbox_run_code(
-    command: Annotated[str | None, Field(description="Shell command to execute, e.g. 'python train.py'.")] = None,
-    network: Annotated[bool, Field(description="Temporarily enable internet for this command.")] = False,
+    command: Annotated[
+        str | None, Field(description="Shell command to execute, e.g. 'python train.py'.")
+    ] = None,
+    network: Annotated[
+        bool, Field(description="Temporarily enable internet for this command.")
+    ] = False,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
@@ -833,7 +857,9 @@ async def sandbox_run_code(
         data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
 
             # Enable network temporarily if requested (and not already persistent)
             temp_network = False
@@ -945,9 +971,16 @@ Relative paths resolve from /workspace.
 - encoding: "utf-8" (default) or "base64" for binary files.""",
 )
 async def sandbox_write_file(
-    path: Annotated[str | None, Field(description="Destination path in the sandbox (relative to /workspace or absolute).")] = None,
-    content: Annotated[str | None, Field(description="File content (text, or base64 when encoding='base64').")] = None,
-    encoding: Annotated[str, Field(description="'utf-8' (default) or 'base64' for binary files.")] = "utf-8",
+    path: Annotated[
+        str | None,
+        Field(description="Destination path in the sandbox (relative to /workspace or absolute)."),
+    ] = None,
+    content: Annotated[
+        str | None, Field(description="File content (text, or base64 when encoding='base64').")
+    ] = None,
+    encoding: Annotated[
+        str, Field(description="'utf-8' (default) or 'base64' for binary files.")
+    ] = "utf-8",
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
@@ -956,14 +989,18 @@ async def sandbox_write_file(
     if content is None:
         return json.dumps({"status": "error", "error": "No content specified"}, indent=2)
     if encoding not in ("utf-8", "base64"):
-        return json.dumps({"status": "error", "error": "encoding must be 'utf-8' or 'base64'"}, indent=2)
+        return json.dumps(
+            {"status": "error", "error": "encoding must be 'utf-8' or 'base64'"}, indent=2
+        )
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
         data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
 
             # Normalise to absolute path inside container
             if not path.startswith("/"):
@@ -1005,7 +1042,12 @@ async def sandbox_write_file(
                         f.write(raw)
 
                     result = subprocess.run(
-                        ["docker", "cp", tmp_path, f"{container_info.container_id}:{container_path}"],
+                        [
+                            "docker",
+                            "cp",
+                            tmp_path,
+                            f"{container_info.container_id}:{container_path}",
+                        ],
                         capture_output=True,
                         text=True,
                         timeout=30,
@@ -1116,7 +1158,9 @@ async def sandbox_write_file(
 - max_depth: Recursion depth 1-10 (default 3)""",
 )
 async def sandbox_list_files(
-    path: Annotated[str, Field(description="Directory to list (relative to /workspace or absolute).")] = ".",
+    path: Annotated[
+        str, Field(description="Directory to list (relative to /workspace or absolute).")
+    ] = ".",
     max_depth: Annotated[int, Field(description="Recursion depth, 1-10.")] = 3,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
@@ -1126,7 +1170,9 @@ async def sandbox_list_files(
         data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
 
             # Normalise to absolute path inside container
             if not path.startswith("/"):
@@ -1309,7 +1355,9 @@ async def sandbox_enable_network(
         data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
             success = _manager.enable_network(container_info.container_id)
             if success:
                 container_info.network_enabled = True
@@ -1346,7 +1394,9 @@ async def sandbox_disable_network(
         data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
             success = _manager.disable_network(container_info.container_id)
             if success:
                 container_info.network_enabled = False
@@ -1378,8 +1428,13 @@ async def sandbox_disable_network(
 - dest: Absolute server path to save to (default: session downloads directory).""",
 )
 async def sandbox_download_file(
-    path: Annotated[str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")] = None,
-    dest: Annotated[str | None, Field(description="Destination filename hint for the agent (not used server-side).")] = None,
+    path: Annotated[
+        str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")
+    ] = None,
+    dest: Annotated[
+        str | None,
+        Field(description="Destination filename hint for the agent (not used server-side)."),
+    ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     data_path: Annotated[str | None, Field(description="Agent data directory.")] = None,
     ctx: Context | None = None,
@@ -1392,7 +1447,9 @@ async def sandbox_download_file(
         session_data_path = data_path if data_path else _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, session_data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, session_data_path, extra_mounts=DATA_MOUNTS
+            )
 
             # Normalise path to absolute
             if not path.startswith("/"):
@@ -1473,28 +1530,46 @@ async def sandbox_download_file(
 )
 async def sandbox_upload_file(
     src: Annotated[str | None, Field(description="Absolute server path to copy from.")] = None,
-    data: Annotated[str | None, Field(description="Base64-encoded file content (requires filename).")] = None,
-    content: Annotated[str | None, Field(description="Plain UTF-8 text content (requires filename).")] = None,
-    filename: Annotated[str | None, Field(description="Name for the file when using data or content.")] = None,
-    dest: Annotated[str | None, Field(description="Destination in sandbox (relative to /workspace or absolute).")] = None,
+    data: Annotated[
+        str | None, Field(description="Base64-encoded file content (requires filename).")
+    ] = None,
+    content: Annotated[
+        str | None, Field(description="Plain UTF-8 text content (requires filename).")
+    ] = None,
+    filename: Annotated[
+        str | None, Field(description="Name for the file when using data or content.")
+    ] = None,
+    dest: Annotated[
+        str | None,
+        Field(description="Destination in sandbox (relative to /workspace or absolute)."),
+    ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     data_path: Annotated[str | None, Field(description="Agent data directory.")] = None,
     ctx: Context | None = None,
 ) -> str:
     modes_set = sum(x is not None for x in (src, data, content))
     if modes_set == 0:
-        return json.dumps({"status": "error", "error": "Provide one of: src, data, or content"}, indent=2)
+        return json.dumps(
+            {"status": "error", "error": "Provide one of: src, data, or content"}, indent=2
+        )
     if modes_set > 1:
-        return json.dumps({"status": "error", "error": "Provide only one of: src, data, or content"}, indent=2)
+        return json.dumps(
+            {"status": "error", "error": "Provide only one of: src, data, or content"}, indent=2
+        )
     if (data is not None or content is not None) and not filename:
-        return json.dumps({"status": "error", "error": "filename is required when using data or content"}, indent=2)
+        return json.dumps(
+            {"status": "error", "error": "filename is required when using data or content"},
+            indent=2,
+        )
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
         session_data_path = data_path if data_path else _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, session_data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, session_data_path, extra_mounts=DATA_MOUNTS
+            )
 
             # --- Inline data mode: decode base64 to temp file, then docker cp ---
             if data is not None:
@@ -1528,7 +1603,12 @@ async def sandbox_upload_file(
                         f.write(raw)
 
                     result = subprocess.run(
-                        ["docker", "cp", tmp_path, f"{container_info.container_id}:{container_dest}"],
+                        [
+                            "docker",
+                            "cp",
+                            tmp_path,
+                            f"{container_info.container_id}:{container_dest}",
+                        ],
                         capture_output=True,
                         text=True,
                         timeout=300,
@@ -1579,7 +1659,12 @@ async def sandbox_upload_file(
                         f.write(raw)
 
                     result = subprocess.run(
-                        ["docker", "cp", tmp_path, f"{container_info.container_id}:{container_dest}"],
+                        [
+                            "docker",
+                            "cp",
+                            tmp_path,
+                            f"{container_info.container_id}:{container_dest}",
+                        ],
                         capture_output=True,
                         text=True,
                         timeout=300,
@@ -1711,9 +1796,13 @@ async def sandbox_upload_file(
 - offset: Byte offset to start from (default 0, useful for tailing logs)""",
 )
 async def sandbox_read_file(
-    path: Annotated[str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")] = None,
+    path: Annotated[
+        str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")
+    ] = None,
     max_bytes: Annotated[int, Field(description="Max bytes to read (cap 1MB).")] = 100000,
-    offset: Annotated[int, Field(description="Byte offset to start from (useful for tailing logs).")] = 0,
+    offset: Annotated[
+        int, Field(description="Byte offset to start from (useful for tailing logs).")
+    ] = 0,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
@@ -1725,7 +1814,9 @@ async def sandbox_read_file(
         data_path = _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
 
             # Normalise to absolute path inside container
             if not path.startswith("/"):
