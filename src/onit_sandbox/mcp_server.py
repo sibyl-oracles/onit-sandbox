@@ -1379,15 +1379,13 @@ async def sandbox_disable_network(
 )
 async def sandbox_download_file(
     path: Annotated[str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")] = None,
-    dest: Annotated[str | None, Field(description="Absolute path to save the file to. Required — the file is copied from the sandbox directly to this location.")] = None,
+    dest: Annotated[str | None, Field(description="Destination filename hint for the agent (not used server-side).")] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    data_path: Annotated[str | None, Field(description="Agent data directory to save to.")] = None,
+    data_path: Annotated[str | None, Field(description="Agent data directory.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not path:
         return json.dumps({"status": "error", "error": "No path specified"}, indent=2)
-    if not dest:
-        return json.dumps({"status": "error", "error": "No dest specified"}, indent=2)
 
     def _impl() -> str:
         sid = _get_session_id(session_id)
@@ -1404,51 +1402,44 @@ async def sandbox_download_file(
 
             dl_filename = os.path.basename(container_path)
 
-            # Resolve destination path — use data_path as base when provided
-            if dest.startswith("/"):
-                resolved_dest = dest
-            else:
-                dl_dir = session_data_path
-                os.makedirs(dl_dir, exist_ok=True)
-                resolved_dest = os.path.join(dl_dir, dest or dl_filename)
+            # docker cp to a server-local temp directory, then return as base64
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_dest = os.path.join(tmpdir, dl_filename)
 
-            # Ensure destination directory exists
-            os.makedirs(os.path.dirname(os.path.abspath(resolved_dest)), exist_ok=True)
-
-            # Use docker cp to copy file directly to destination
-            result = subprocess.run(
-                [
-                    "docker",
-                    "cp",
-                    f"{container_info.container_id}:{container_path}",
-                    resolved_dest,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode != 0:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "error": f"docker cp failed: {result.stderr.strip()}",
-                    },
-                    indent=2,
+                result = subprocess.run(
+                    [
+                        "docker",
+                        "cp",
+                        f"{container_info.container_id}:{container_path}",
+                        tmp_dest,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
                 )
+                if result.returncode != 0:
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": f"docker cp failed: {result.stderr.strip()}",
+                        },
+                        indent=2,
+                    )
 
-            try:
-                size_bytes = os.path.getsize(resolved_dest)
-            except OSError:
-                size_bytes = None
+                with open(tmp_dest, "rb") as f:
+                    file_bytes = f.read()
 
-            resp: dict[str, Any] = {
-                "status": "ok",
-                "session_id": sid,
-                "filename": dl_filename,
-                "dest": resolved_dest,
-                "size_bytes": size_bytes,
-            }
-            return json.dumps(resp, indent=2)
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "file_name": dl_filename,
+                    "file_data_base64": base64.b64encode(file_bytes).decode(),
+                    "mime_type": "application/octet-stream",
+                    "size_bytes": len(file_bytes),
+                    "session_id": sid,
+                },
+                indent=2,
+            )
 
         except DockerNotAvailableError:
             return json.dumps(

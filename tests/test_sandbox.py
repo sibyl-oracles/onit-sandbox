@@ -5,6 +5,7 @@ These tests verify the sandbox functionality with and without Docker.
 """
 
 import asyncio
+import base64
 import json
 import os
 
@@ -96,9 +97,10 @@ class TestSandboxTools:
         assert data["status"] == "error"
 
     def test_sandbox_download_file_no_dest(self):
-        """Test sandbox_download_file with no dest specified."""
+        """Test sandbox_download_file with no dest specified — still works (dest is optional)."""
         result = _run(sandbox_download_file(path="file.txt", dest=None))
         data = json.loads(result)
+        # No container exists, so it errors on container creation, not on missing dest
         assert data["status"] == "error"
 
 
@@ -190,24 +192,23 @@ class TestSandboxWithDocker:
         assert "200" in data["stdout"]
 
     def test_sandbox_download_file(self, sandbox_session):
-        """Test copying a file from the sandbox to the local filesystem."""
+        """Test downloading a file from the sandbox as base64."""
         session_id, tmp_path = sandbox_session
 
         # Create a file inside the sandbox
         _run(sandbox_run_code(command="echo 'download test' > /workspace/dl_test.txt"))
 
-        # Download it to a local path
-        dest = str(tmp_path / "downloaded.txt")
-        result = _run(sandbox_download_file(path="dl_test.txt", dest=dest))
+        # Download it — returns base64 content
+        result = _run(sandbox_download_file(path="dl_test.txt"))
         data = json.loads(result)
 
         assert data["status"] == "ok"
-        assert data["dest"] == dest
-        assert data["filename"] == "dl_test.txt"
+        assert data["file_name"] == "dl_test.txt"
         assert data["size_bytes"] > 0
-        assert os.path.isfile(dest)
-        with open(dest) as f:
-            assert "download test" in f.read()
+        assert "file_data_base64" in data
+        # Verify base64 content decodes correctly
+        content = base64.b64decode(data["file_data_base64"]).decode()
+        assert "download test" in content
 
     def test_sandbox_download_file_not_found(self, sandbox_session):
         """Test downloading a nonexistent file from the sandbox."""
@@ -216,8 +217,7 @@ class TestSandboxWithDocker:
         # Ensure sandbox is running
         _run(sandbox_run_code(command="echo hello"))
 
-        dest = str(tmp_path / "missing.txt")
-        result = _run(sandbox_download_file(path="no_such_file.txt", dest=dest))
+        result = _run(sandbox_download_file(path="no_such_file.txt"))
         data = json.loads(result)
 
         assert data["status"] == "error"
