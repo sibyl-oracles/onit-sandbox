@@ -48,6 +48,7 @@ from onit_sandbox.server import (
     DEFAULT_MEMORY_LIMIT,
     DEFAULT_PIDS_LIMIT,
     DEFAULT_PIP_CACHE_PATH,
+    DEFAULT_SHM_SIZE,
     DEFAULT_TIMEOUT,
     FALLBACK_IMAGE,
     INSTALL_TIMEOUT,
@@ -237,10 +238,14 @@ class SandboxManager:
             "/workspace",
             "--memory",
             DEFAULT_MEMORY_LIMIT,
-            "--cpu-quota",
-            str(DEFAULT_CPU_QUOTA),
             "--pids-limit",
             str(DEFAULT_PIDS_LIMIT),
+            "--shm-size",
+            DEFAULT_SHM_SIZE,
+            "--ulimit",
+            "memlock=-1:-1",
+            "--ulimit",
+            "stack=67108864:67108864",
             "--dns",
             "8.8.8.8",
             "--dns",
@@ -252,8 +257,16 @@ class SandboxManager:
             "-e",
             "PATH=/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin",
             "-e",
-            "OMP_NUM_THREADS=4",
+            f"OMP_NUM_THREADS={os.cpu_count() or 4}",
+            "-e",
+            "HF_HOME=/home/sandbox/.cache/huggingface",
+            "-e",
+            "TRANSFORMERS_CACHE=/home/sandbox/.cache/huggingface/transformers",
         ]
+
+        # Only apply CPU quota if explicitly set (0 = no limit)
+        if DEFAULT_CPU_QUOTA > 0:
+            cmd.extend(["--cpu-quota", str(DEFAULT_CPU_QUOTA)])
 
         # Add extra data volume mounts (e.g. /data:/data:ro)
         for mount in extra_mounts or []:

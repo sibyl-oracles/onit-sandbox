@@ -36,17 +36,31 @@ RUN pip install --no-cache-dir \
     jsonlines \
     pillow
 
-# Set up workspace and data directories
-RUN mkdir -p /workspace /data && chown sandbox:sandbox /workspace /data
+# Install packages for large-scale training
+RUN pip install --no-cache-dir \
+    accelerate \
+    deepspeed \
+    bitsandbytes \
+    peft
 
-# Ensure pip cache and user-install dirs are writable by sandbox user
-RUN mkdir -p /home/sandbox/.cache/pip /home/sandbox/.local \
+# flash-attn requires CUDA at build time; skip gracefully if unavailable
+RUN pip install --no-cache-dir flash-attn --no-build-isolation || true
+
+# Set up workspace, data, and model cache directories
+RUN mkdir -p /workspace /data /models \
+    && chown sandbox:sandbox /workspace /data /models
+
+# Ensure pip cache, HuggingFace cache, and user-install dirs are writable
+RUN mkdir -p /home/sandbox/.cache/pip /home/sandbox/.cache/huggingface /home/sandbox/.local \
     && chown -R sandbox:sandbox /home/sandbox
 
 # Switch to non-root user
 USER sandbox
 ENV HOME=/home/sandbox
 ENV PATH="/home/sandbox/.local/bin:${PATH}"
+# Point HuggingFace cache to a persistent-friendly location
+ENV HF_HOME=/home/sandbox/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/home/sandbox/.cache/huggingface/transformers
 
 # Set working directory
 WORKDIR /workspace

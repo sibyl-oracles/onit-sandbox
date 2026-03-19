@@ -85,7 +85,7 @@ pip install -e .
 
 ### Step 2 — Build (or pull) the Docker image
 
-The sandbox image comes pre-loaded with PyTorch (CUDA), the common scientific Python stack, and ML/data pipeline packages so agents can start training immediately.
+The sandbox image comes pre-loaded with PyTorch (CUDA), the common scientific Python stack, large-scale training libraries, and ML/data pipeline packages so agents can start training immediately.
 
 **Option A — Pull from GHCR:**
 
@@ -102,13 +102,25 @@ chmod +x build.sh
 ./build.sh        # builds onit-sandbox:latest
 ```
 
+> **Rebuilding after updates:** If you have previously built the image, you must rebuild it to pick up new packages or configuration changes. The build script will replace your existing `onit-sandbox:latest` image. Running containers based on the old image are unaffected — stop and restart sessions to use the new image.
+>
+> ```bash
+> # Force a clean rebuild (no layer cache)
+> docker build --no-cache -t onit-sandbox:latest docker/
+>
+> # Or use the build script (uses layer cache by default)
+> cd docker && ./build.sh
+> ```
+
 Pre-installed packages:
 
 | Package | Description |
 |---------|-------------|
+| **PyTorch ecosystem** | |
 | torch | Deep learning (CUDA) |
 | torchvision | Vision models and transforms |
 | torchaudio | Audio processing |
+| **Scientific stack** | |
 | numpy | Numerical computing |
 | matplotlib | Plotting and visualization |
 | scipy | Scientific computing |
@@ -116,6 +128,7 @@ Pre-installed packages:
 | scikit-learn | Machine learning |
 | sympy | Symbolic mathematics |
 | pytest | Testing framework |
+| **Data pipeline** | |
 | datasets | Hugging Face datasets |
 | transformers | Hugging Face transformers |
 | safetensors | Safe model serialization |
@@ -124,6 +137,12 @@ Pre-installed packages:
 | pyyaml | YAML parsing |
 | jsonlines | JSONL file handling |
 | pillow | Image processing |
+| **Large-scale training** | |
+| accelerate | Distributed training (Hugging Face) |
+| deepspeed | Memory-efficient distributed training |
+| bitsandbytes | 8-bit/4-bit quantization |
+| peft | Parameter-efficient fine-tuning (LoRA, QLoRA) |
+| flash-attn | Flash Attention (requires CUDA at build time) |
 
 > **Fallback:** If no custom image is found, the server falls back to `python:3.12-slim` automatically. Packages can still be installed at runtime via `install_packages`.
 
@@ -323,12 +342,13 @@ onit-sandbox start [OPTIONS]
 |----------|---------|-------------|
 | `SANDBOX_IMAGE` | `onit-sandbox:latest` | Docker image to use |
 | `FALLBACK_IMAGE` | `python:3.12-slim` | Fallback if sandbox image unavailable |
-| `SANDBOX_MEMORY_LIMIT` | `2g` | Container memory limit |
-| `SANDBOX_CPU_QUOTA` | `100000` | CPU quota (100000 = 1 CPU) |
-| `SANDBOX_PIDS_LIMIT` | `256` | Max processes in container |
-| `SANDBOX_DEFAULT_TIMEOUT` | `60` | Default command timeout (seconds) |
-| `SANDBOX_MAX_TIMEOUT` | `3600` | Maximum command timeout (seconds) |
-| `SANDBOX_INSTALL_TIMEOUT` | `300` | Package install timeout (seconds) |
+| `SANDBOX_MEMORY_LIMIT` | `64g` | Container memory limit |
+| `SANDBOX_CPU_QUOTA` | `0` | CPU quota (0 = no limit, use all available CPUs) |
+| `SANDBOX_PIDS_LIMIT` | `4096` | Max processes in container |
+| `SANDBOX_SHM_SIZE` | `16g` | Shared memory size (`/dev/shm`) for PyTorch DataLoader workers |
+| `SANDBOX_DEFAULT_TIMEOUT` | `600` | Default command timeout (seconds) |
+| `SANDBOX_MAX_TIMEOUT` | `86400` | Maximum command timeout — 24 hours (seconds) |
+| `SANDBOX_INSTALL_TIMEOUT` | `600` | Package install timeout (seconds) |
 | `SANDBOX_PIP_CACHE_PATH` | `/tmp/onit/pip-cache` | Shared pip cache across sessions |
 | `SANDBOX_DATA_MOUNTS` | *(empty)* | Comma-separated mount specs (e.g. `/data:/data:ro`) |
 | `SANDBOX_MAX_OUTPUT_BYTES` | `50000` | Max stdout/stderr bytes per tool call |
@@ -345,12 +365,13 @@ server:
 
 docker:
   sandbox_image: onit-sandbox:latest
-  memory_limit: 2g
-  cpu_quota: 100000
-  pids_limit: 256
+  memory_limit: 64g
+  cpu_quota: 0           # 0 = no limit
+  pids_limit: 4096
+  shm_size: 16g          # shared memory for DataLoader workers
   network_disabled_default: true
-  default_timeout: 60
-  max_timeout: 3600
+  default_timeout: 600
+  max_timeout: 86400     # 24 hours
   max_output_bytes: 50000
   data_mounts: []
   # data_mounts: ["/data:/data:ro", "/models:/models:rw"]
@@ -395,7 +416,7 @@ cleanup_sandbox(session_id="my-session")
 |-------|-----------|
 | Filesystem | Container isolation — only workspace and explicit mounts are accessible |
 | User | Non-root execution as `sandbox` (UID 1000) |
-| Resources | Memory (2 GB), CPU (1 core), PIDs (256) |
+| Resources | Memory (64 GB), CPU (no limit), PIDs (4096), shared memory (16 GB) |
 | Network | Disabled by default — enabled only during `install_packages` or on request |
 | Lifecycle | Containers auto-removed on stop (`--rm` flag) |
 | GPU | Optional NVIDIA GPU passthrough when available |
@@ -463,11 +484,14 @@ mypy src/                # Type check
 | Docker not available | Install Docker and start the daemon (`sudo systemctl start docker` on Linux, or open Docker Desktop on macOS) |
 | Sandbox image not found | Build locally with `cd docker && ./build.sh` or pull from GHCR |
 | Permission denied on workspace | `chmod -R 777 /path/to/workspace` |
-| Command timeout | Increase timeout: `run_code(command="...", timeout=3600)` |
+| Command timeout | Increase timeout: `run_code(command="...", timeout=86400)` |
 | Port already in use | Use `--port` flag: `onit-sandbox start --port 18206` |
 | `gpu_available` is false despite having a GPU | Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) — Docker needs it to expose GPUs to containers. See Prerequisites above. |
 | Mount path does not exist | The server will attempt to create it; ensure the parent directory is writable |
 | Data mount permission denied | Ensure the host directory is readable by UID 1000 (the sandbox user) |
+| DataLoader crashes with shared memory error | Increase shared memory: `SANDBOX_SHM_SIZE=32g` or reduce `num_workers` |
+| OOM during training | Increase memory limit: `SANDBOX_MEMORY_LIMIT=128g`, or use quantization (`bitsandbytes`) / PEFT (`peft`) |
+| Old packages after rebuild | Stop running sessions and restart — containers use the image from when they were created |
 
 ## License
 

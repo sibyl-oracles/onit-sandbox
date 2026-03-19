@@ -17,17 +17,18 @@ docker:
   fallback_image: python:3.12-slim
 
   # Resource limits
-  memory_limit: 2g
-  cpu_quota: 100000  # 1 CPU
-  pids_limit: 256
+  memory_limit: 64g
+  cpu_quota: 0  # 0 = no limit (use all available CPUs)
+  pids_limit: 4096
+  shm_size: 16g  # shared memory for PyTorch DataLoader workers
 
   # Network settings
   network_disabled_default: true
 
   # Timeouts (in seconds)
-  default_timeout: 60
-  install_timeout: 300
-  max_timeout: 3600
+  default_timeout: 600
+  install_timeout: 600
+  max_timeout: 86400  # 24 hours
 
   # Maximum bytes of stdout/stderr returned per tool call
   max_output_bytes: 50000
