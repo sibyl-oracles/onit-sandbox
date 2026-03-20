@@ -1467,15 +1467,13 @@ async def sandbox_download_file(
     if not path:
         return json.dumps({"status": "error", "error": "No path specified"}, indent=2)
 
+    progress_queue: queue.Queue[str | None] = queue.Queue()
+
     def _impl() -> str:
         sid = _get_session_id(session_id)
         session_data_path = data_path if data_path else _get_data_path(sid)
 
         try:
-            container_info = _manager.get_or_create_container(
-                sid, session_data_path, extra_mounts=DATA_MOUNTS
-            )
-
             # Normalise path to absolute
             if not path.startswith("/"):
                 container_path = f"/workspace/{path}"
@@ -1484,10 +1482,18 @@ async def sandbox_download_file(
 
             dl_filename = os.path.basename(container_path)
 
+            progress_queue.put(f"Resolving sandbox container…")
+            container_info = _manager.get_or_create_container(
+                sid, session_data_path, extra_mounts=DATA_MOUNTS
+            )
+
             # docker cp to a server-local temp directory, then return as base64
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp_dest = os.path.join(tmpdir, dl_filename)
 
+                progress_queue.put(
+                    f"Copying {container_path} from sandbox…"
+                )
                 result = subprocess.run(
                     [
                         "docker",
@@ -1508,14 +1514,38 @@ async def sandbox_download_file(
                         indent=2,
                     )
 
+                if not os.path.exists(tmp_dest):
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": f"File not found after docker cp: {container_path}",
+                        },
+                        indent=2,
+                    )
+                if os.path.isdir(tmp_dest):
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": f"Path is a directory, not a file: {container_path}",
+                        },
+                        indent=2,
+                    )
+
+                file_size = os.path.getsize(tmp_dest)
+                progress_queue.put(
+                    f"Reading file ({file_size:,} bytes)…"
+                )
                 with open(tmp_dest, "rb") as f:
                     file_bytes = f.read()
+
+            progress_queue.put(f"Encoding {dl_filename} ({len(file_bytes):,} bytes)…")
+            encoded = base64.b64encode(file_bytes).decode()
 
             return json.dumps(
                 {
                     "status": "ok",
                     "file_name": dl_filename,
-                    "file_data_base64": base64.b64encode(file_bytes).decode(),
+                    "file_data_base64": encoded,
                     "mime_type": "application/octet-stream",
                     "size_bytes": len(file_bytes),
                     "session_id": sid,
@@ -1539,8 +1569,33 @@ async def sandbox_download_file(
                 {"status": "error", "error": str(e)},
                 indent=2,
             )
+        finally:
+            progress_queue.put(None)
 
-    return await _run_with_progress(ctx, _impl)
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, _impl)
+
+    if ctx is None:
+        return await future
+
+    async def _drain() -> None:
+        while True:
+            try:
+                msg = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            if msg is not None:
+                await ctx.info(msg)
+
+    heartbeat = 0
+    while True:
+        done, _ = await asyncio.wait({future}, timeout=0.25)
+        await _drain()
+        if done:
+            await ctx.report_progress(progress=1, total=1)
+            return future.result()
+        heartbeat += 1
+        await ctx.report_progress(progress=heartbeat, total=heartbeat + 1)
 
 
 @mcp.tool(
