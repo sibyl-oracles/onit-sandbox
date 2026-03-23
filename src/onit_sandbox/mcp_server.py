@@ -1566,7 +1566,7 @@ async def sandbox_download_file(
 
             dl_filename = os.path.basename(container_path)
 
-            progress_queue.put(f"Resolving sandbox container…")
+            progress_queue.put("Resolving sandbox container…")
             container_info = _manager.get_or_create_container(
                 sid, session_data_path, extra_mounts=DATA_MOUNTS
             )

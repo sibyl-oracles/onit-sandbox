@@ -15,8 +15,8 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 from onit_sandbox.server import DEFAULT_HOST, DEFAULT_PORT, build_server_url
 
