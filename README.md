@@ -158,6 +158,15 @@ onit-sandbox start --foreground
 # Start with data volume mounts
 onit-sandbox start --mount /data:/data:ro --mount /models:/models:rw
 
+# Start with a specific GPU (e.g. GPU 2)
+onit-sandbox start --gpu 2
+
+# Or use CUDA_VISIBLE_DEVICES (automatically picked up)
+CUDA_VISIBLE_DEVICES=2 onit-sandbox start
+
+# Multiple GPUs
+onit-sandbox start --gpu 0,1
+
 # Check status
 onit-sandbox status
 
@@ -334,6 +343,9 @@ onit-sandbox start [OPTIONS]
   --mount        Mount host directory into sandbox (repeatable)
                  Format: HOST_PATH:CONTAINER_PATH[:MODE]
                  MODE is "ro" (default) or "rw"
+  --gpu          GPU device(s) to expose to containers
+                 Examples: "0", "1", "2", "0,1", "all" (default)
+                 Overrides CUDA_VISIBLE_DEVICES and SANDBOX_GPU_DEVICES env vars
 ```
 
 ### Environment Variables
@@ -351,6 +363,7 @@ onit-sandbox start [OPTIONS]
 | `SANDBOX_INSTALL_TIMEOUT` | `600` | Package install timeout (seconds) |
 | `SANDBOX_PIP_CACHE_PATH` | `/tmp/onit/pip-cache` | Shared pip cache across sessions |
 | `SANDBOX_DATA_MOUNTS` | *(empty)* | Comma-separated mount specs (e.g. `/data:/data:ro`) |
+| `SANDBOX_GPU_DEVICES` | `all` | GPU device(s) to expose (e.g. `0`, `0,1`, `all`). Falls back to `CUDA_VISIBLE_DEVICES` if unset. |
 | `SANDBOX_MAX_OUTPUT_BYTES` | `50000` | Max stdout/stderr bytes per tool call |
 
 ### YAML Configuration
@@ -487,6 +500,7 @@ mypy src/                # Type check
 | Command timeout | Increase timeout: `run_code(command="...", timeout=86400)` |
 | Port already in use | Use `--port` flag: `onit-sandbox start --port 18206` |
 | `gpu_available` is false despite having a GPU | Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) — Docker needs it to expose GPUs to containers. See Prerequisites above. |
+| Wrong GPU used inside container | Use `--gpu` to select a specific device: `onit-sandbox start --gpu 2`. `CUDA_VISIBLE_DEVICES` on the host is also respected. |
 | Mount path does not exist | The server will attempt to create it; ensure the parent directory is writable |
 | Data mount permission denied | Ensure the host directory is readable by UID 1000 (the sandbox user) |
 | DataLoader crashes with shared memory error | Increase shared memory: `SANDBOX_SHM_SIZE=32g` or reduce `num_workers` |

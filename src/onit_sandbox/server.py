@@ -33,6 +33,15 @@ MAX_TIMEOUT = int(os.getenv("SANDBOX_MAX_TIMEOUT", "86400"))  # 24 hours
 INSTALL_TIMEOUT = int(os.getenv("SANDBOX_INSTALL_TIMEOUT", "600"))
 DEFAULT_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "16g")
 
+# GPU device selection.
+# Specify which GPU device(s) to expose to containers.
+# Examples: "0", "1", "2", "0,1", "all" (default).
+# Can also be set via CLI --gpu flag or CUDA_VISIBLE_DEVICES env var.
+DEFAULT_GPU_DEVICES = os.getenv(
+    "SANDBOX_GPU_DEVICES",
+    os.getenv("CUDA_VISIBLE_DEVICES", "all"),
+)
+
 # Data mount configuration.
 # Comma-separated list of "host_path:container_path[:mode]" entries.
 # mode is "ro" (read-only, default) or "rw" (read-write).

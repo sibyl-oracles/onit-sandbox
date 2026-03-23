@@ -45,6 +45,7 @@ from pydantic import Field
 from onit_sandbox.server import (
     DEFAULT_CPU_QUOTA,
     DEFAULT_DATA_MOUNTS,
+    DEFAULT_GPU_DEVICES,
     DEFAULT_MEMORY_LIMIT,
     DEFAULT_PIDS_LIMIT,
     DEFAULT_PIP_CACHE_PATH,
@@ -94,6 +95,7 @@ class SandboxManager:
         self._lock = threading.Lock()
         self._docker_available: bool | None = None
         self._gpu_available: bool | None = None
+        self._gpu_devices: str = DEFAULT_GPU_DEVICES
 
     def _check_docker(self) -> bool:
         """Check if Docker is available and running."""
@@ -140,13 +142,14 @@ class SandboxManager:
                 return self._gpu_available
 
             # Step 2: Verify an actual GPU is accessible
+            gpus_flag = self._docker_gpus_flag()
             result = subprocess.run(
                 [
                     "docker",
                     "run",
                     "--rm",
                     "--gpus",
-                    "all",
+                    gpus_flag,
                     "nvidia/cuda:12.0.0-base-ubuntu22.04",
                     "nvidia-smi",
                     "--query-gpu=name",
@@ -172,6 +175,18 @@ class SandboxManager:
             logger.debug("GPU check failed — containers will run CPU-only")
 
         return self._gpu_available
+
+    def _docker_gpus_flag(self) -> str:
+        """Return the value for ``docker run --gpus <value>``.
+
+        When ``_gpu_devices`` is ``"all"`` we pass ``"all"``; otherwise we
+        pass ``'"device=0"'`` / ``'"device=0,1"'`` so Docker maps only the
+        requested GPU(s).
+        """
+        devices = self._gpu_devices.strip()
+        if devices.lower() == "all":
+            return "all"
+        return f'"device={devices}"'
 
     def _check_image_exists(self, image: str) -> bool:
         """Check if a Docker image exists locally."""
@@ -278,7 +293,7 @@ class SandboxManager:
             )
 
         if gpu_available:
-            cmd.extend(["--gpus", "all"])
+            cmd.extend(["--gpus", self._docker_gpus_flag()])
 
         cmd.extend(["--rm", image, "sleep", "infinity"])
 
@@ -2013,6 +2028,9 @@ def run(
         SESSION_ID = options["session_id"]
     if "data_mounts" in options:
         DATA_MOUNTS = parse_data_mounts(options["data_mounts"])
+    if "gpu_devices" in options:
+        _manager._gpu_devices = options["gpu_devices"]
+        logger.info("GPU device selection: %s", options["gpu_devices"])
     if DATA_MOUNTS:
         logger.info(
             "Data mounts configured: %s",

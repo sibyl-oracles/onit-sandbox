@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Any
 from pathlib import Path
 
 from onit_sandbox.server import DEFAULT_HOST, DEFAULT_PORT, build_server_url
@@ -89,15 +90,18 @@ def _run_foreground(args: argparse.Namespace) -> None:
 
     _write_pid(os.getpid())
     try:
+        opts: dict[str, Any] = {
+            "data_path": getattr(args, "data_path", "/tmp/onit/data"),
+            "verbose": args.verbose,
+            "data_mounts": mounts,
+        }
+        if getattr(args, "gpu", None) is not None:
+            opts["gpu_devices"] = args.gpu
         mcp_run(
             transport=args.transport,
             host=args.host,
             port=args.port,
-            options={
-                "data_path": getattr(args, "data_path", "/tmp/onit/data"),
-                "verbose": args.verbose,
-                "data_mounts": mounts,
-            },
+            options=opts,
         )
     finally:
         _remove_pid()
@@ -124,6 +128,8 @@ def _run_background(args: argparse.Namespace) -> None:
         cmd.append("--verbose")
     for m in getattr(args, "mount", None) or []:
         cmd.extend(["--mount", m])
+    if getattr(args, "gpu", None) is not None:
+        cmd.extend(["--gpu", args.gpu])
 
     log_fh = open(LOG_FILE, "a")
     process = subprocess.Popen(
@@ -227,6 +233,16 @@ def build_parser() -> argparse.ArgumentParser:
             "MODE is 'ro' (read-only, default) or 'rw'. "
             "Can be specified multiple times. "
             "Example: --mount /data:/data:ro --mount /models:/models:rw"
+        ),
+    )
+    start_p.add_argument(
+        "--gpu",
+        default=None,
+        metavar="DEVICE",
+        help=(
+            "GPU device(s) to expose to containers. "
+            "Examples: '0', '1', '2', '0,1', 'all' (default). "
+            "Overrides CUDA_VISIBLE_DEVICES and SANDBOX_GPU_DEVICES env vars."
         ),
     )
 
