@@ -412,9 +412,9 @@ class SandboxManager:
             '# Only respond to "get" requests\n'
             'if [ "$1" != "get" ]; then exit 0; fi\n'
             "# Read input to check for github.com\n"
-            'while IFS= read -r line; do\n'
+            "while IFS= read -r line; do\n"
             '  case "$line" in\n'
-            '    host=github.com) MATCH=1 ;;\n'
+            "    host=github.com) MATCH=1 ;;\n"
             '    "") break ;;\n'
             "  esac\n"
             "done\n"
@@ -1575,9 +1575,7 @@ async def sandbox_download_file(
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp_dest = os.path.join(tmpdir, dl_filename)
 
-                progress_queue.put(
-                    f"Copying {container_path} from sandbox…"
-                )
+                progress_queue.put(f"Copying {container_path} from sandbox…")
                 result = subprocess.run(
                     [
                         "docker",
@@ -1616,9 +1614,7 @@ async def sandbox_download_file(
                     )
 
                 file_size = os.path.getsize(tmp_dest)
-                progress_queue.put(
-                    f"Reading file ({file_size:,} bytes)…"
-                )
+                progress_queue.put(f"Reading file ({file_size:,} bytes)…")
                 with open(tmp_dest, "rb") as f:
                     file_bytes = f.read()
 
@@ -2082,9 +2078,7 @@ def _run_git_command(
     data_path = _get_data_path(sid)
 
     try:
-        container_info = _manager.get_or_create_container(
-            sid, data_path, extra_mounts=DATA_MOUNTS
-        )
+        container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
 
         temp_network = False
         if network and not container_info.network_enabled:
@@ -2139,7 +2133,9 @@ Network is enabled automatically during clone.
 async def sandbox_git_clone(
     url: Annotated[
         str,
-        Field(description="Repository URL to clone (HTTPS), e.g. 'https://github.com/user/repo.git'."),
+        Field(
+            description="Repository URL to clone (HTTPS), e.g. 'https://github.com/user/repo.git'."
+        ),
     ],
     path: Annotated[
         str | None,
@@ -2245,7 +2241,7 @@ async def sandbox_git_commit(
         cd = f"cd /workspace/{path} && " if path else ""
         # Use heredoc to safely pass the commit message
         all_flag = " -a" if all else ""
-        cmd = f'{cd}git commit{all_flag} -m "$(cat <<\'COMMITMSG\'\n{message}\nCOMMITMSG\n)"'
+        cmd = f"{cd}git commit{all_flag} -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
         return _run_git_command(cmd, session_id=session_id)
 
     return await _run_with_progress(ctx, _impl)
@@ -2453,7 +2449,9 @@ async def sandbox_git_diff(
     ] = False,
     target: Annotated[
         str | None,
-        Field(description="Compare against a specific commit, branch, or ref (e.g. 'HEAD~1', 'main')."),
+        Field(
+            description="Compare against a specific commit, branch, or ref (e.g. 'HEAD~1', 'main')."
+        ),
     ] = None,
     files: Annotated[
         str | None,
@@ -2488,7 +2486,9 @@ async def sandbox_git_diff(
 async def sandbox_git_init(
     path: Annotated[
         str | None,
-        Field(description="Directory to initialize relative to /workspace. Defaults to /workspace."),
+        Field(
+            description="Directory to initialize relative to /workspace. Defaults to /workspace."
+        ),
     ] = None,
     default_branch: Annotated[
         str | None,
