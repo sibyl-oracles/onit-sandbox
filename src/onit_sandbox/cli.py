@@ -1,15 +1,17 @@
 """
 CLI for the Sandbox MCP Server.
 
-Provides start / stop / status subcommands with PID-file management,
+Provides start / stop / status / setup subcommands with PID-file management,
 mirroring the pattern used in onit-workspace.
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -22,6 +24,7 @@ from onit_sandbox.server import DEFAULT_HOST, DEFAULT_PORT, build_server_url
 STATE_DIR = Path.home() / ".onit-sandbox"
 PID_FILE = STATE_DIR / "server.pid"
 LOG_FILE = STATE_DIR / "server.log"
+GITHUB_TOKEN_FILE = STATE_DIR / "github_token"
 
 
 def _ensure_state_dir() -> None:
@@ -195,6 +198,219 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GitHub token management
+# ---------------------------------------------------------------------------
+
+_KEYRING_SERVICE = "onit-sandbox"
+_KEYRING_USERNAME = "github-token"
+
+
+def _keyring_available() -> bool:
+    """Check if the keyring library is installed and has a usable backend."""
+    try:
+        import keyring
+        from keyring.backends.fail import Keyring as FailKeyring
+
+        backend = keyring.get_keyring()
+        # fail backend means no real keychain is available
+        return not isinstance(backend, FailKeyring)
+    except Exception:
+        return False
+
+
+def _save_token_to_keyring(token: str) -> bool:
+    """Store token in the OS keychain. Returns True on success."""
+    try:
+        import keyring
+
+        keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, token)
+        return True
+    except Exception:
+        return False
+
+
+def _load_token_from_keyring() -> str | None:
+    """Load token from the OS keychain, or None."""
+    try:
+        import keyring
+
+        token = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+        return token if token else None
+    except Exception:
+        return None
+
+
+def _delete_token_from_keyring() -> bool:
+    """Delete token from the OS keychain. Returns True on success."""
+    try:
+        import keyring
+
+        keyring.delete_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+        return True
+    except Exception:
+        return False
+
+
+def _save_token_to_file(token: str) -> None:
+    """Store token in a file with restricted permissions (fallback)."""
+    _ensure_state_dir()
+    GITHUB_TOKEN_FILE.write_text(token)
+    GITHUB_TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+
+
+def _load_token_from_file() -> str | None:
+    """Load token from the file-based store, or None."""
+    if GITHUB_TOKEN_FILE.exists():
+        try:
+            token = GITHUB_TOKEN_FILE.read_text().strip()
+            return token if token else None
+        except OSError:
+            return None
+    return None
+
+
+def _delete_token_from_file() -> bool:
+    """Delete token file. Returns True if it existed."""
+    if GITHUB_TOKEN_FILE.exists():
+        GITHUB_TOKEN_FILE.unlink()
+        return True
+    return False
+
+
+def load_github_token() -> str | None:
+    """Load the stored GitHub token.
+
+    Checks the OS keychain first, then falls back to the file-based store.
+    """
+    if _keyring_available():
+        token = _load_token_from_keyring()
+        if token:
+            return token
+    return _load_token_from_file()
+
+
+def _save_github_token(token: str) -> str:
+    """Save token to the best available backend.
+
+    Returns a human-readable description of where it was stored.
+    """
+    if _keyring_available():
+        if _save_token_to_keyring(token):
+            # Also remove any leftover plaintext file
+            _delete_token_from_file()
+            return "OS keychain"
+    # Fallback to file
+    _save_token_to_file(token)
+    return f"{GITHUB_TOKEN_FILE} (mode 600)"
+
+
+def _delete_github_token() -> bool:
+    """Delete token from all backends. Returns True if anything was deleted."""
+    deleted = False
+    if _keyring_available():
+        deleted = _delete_token_from_keyring() or deleted
+    deleted = _delete_token_from_file() or deleted
+    return deleted
+
+
+def _token_storage_location() -> str | None:
+    """Return a description of where the token is currently stored, or None."""
+    if _keyring_available():
+        if _load_token_from_keyring():
+            return "OS keychain"
+    if _load_token_from_file():
+        return f"file ({GITHUB_TOKEN_FILE})"
+    return None
+
+
+def cmd_setup(args: argparse.Namespace) -> None:
+    """Interactive setup for GitHub authentication."""
+    _ensure_state_dir()
+
+    action = getattr(args, "setup_action", None)
+
+    if action == "remove":
+        if _delete_github_token():
+            print("GitHub token removed.")
+        else:
+            print("No GitHub token configured.")
+        return
+
+    if action == "status":
+        token = load_github_token()
+        if token:
+            masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "****"
+            location = _token_storage_location()
+            print(f"GitHub token is configured: {masked}")
+            print(f"Storage: {location}")
+            if not _keyring_available():
+                print(
+                    "Tip: Install 'keyring' package for OS keychain storage "
+                    "(pip install keyring)"
+                )
+        else:
+            print("No GitHub token configured. Run: onit-sandbox setup")
+        return
+
+    # Default: configure token
+    print("GitHub Authentication Setup")
+    print("=" * 40)
+    print()
+    print("This stores a GitHub Personal Access Token (PAT) for git")
+    print("operations inside the sandbox (clone, push, pull, etc.).")
+    print()
+    if _keyring_available():
+        print("Storage: OS keychain (secure)")
+    else:
+        print(
+            "Storage: encrypted file (~/.onit-sandbox/github_token)\n"
+            "Tip: Install 'keyring' for OS keychain support (pip install keyring)"
+        )
+    print()
+    print("Create a token at: https://github.com/settings/tokens")
+    print("Required scopes: repo (for private repos), or public_repo")
+    print()
+
+    # Check for existing token
+    existing = load_github_token()
+    if existing:
+        masked = existing[:4] + "..." + existing[-4:] if len(existing) > 8 else "****"
+        print(f"Current token: {masked}")
+        confirm = input("Replace existing token? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Keeping existing token.")
+            return
+
+    # Read token (hidden input)
+    token = getpass.getpass("GitHub token (input hidden): ").strip()
+    if not token:
+        print("No token provided. Aborting.")
+        return
+
+    # Validate token format (basic check)
+    if not (
+        token.startswith("ghp_")
+        or token.startswith("gho_")
+        or token.startswith("github_pat_")
+        or token.startswith("ghs_")
+    ):
+        print(
+            "Warning: Token doesn't look like a GitHub token "
+            "(expected ghp_*, gho_*, github_pat_*, or ghs_* prefix)."
+        )
+        confirm = input("Save anyway? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Aborting.")
+            return
+
+    location = _save_github_token(token)
+
+    print()
+    print(f"Token saved to {location}")
+    print("Git operations in the sandbox will now use this token for authentication.")
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -252,6 +468,18 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     subparsers.add_parser("status", help="Check server status")
 
+    # setup
+    setup_p = subparsers.add_parser(
+        "setup", help="Configure GitHub authentication for git operations"
+    )
+    setup_p.add_argument(
+        "setup_action",
+        nargs="?",
+        default=None,
+        choices=["remove", "status"],
+        help="Optional action: 'remove' to delete token, 'status' to check config",
+    )
+
     return parser
 
 
@@ -263,6 +491,8 @@ def main() -> None:
         cmd_stop(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "setup":
+        cmd_setup(args)
     else:
         # Default to "start" when no subcommand is given
         if args.command is None:

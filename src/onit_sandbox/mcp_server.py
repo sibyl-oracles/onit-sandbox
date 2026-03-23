@@ -16,6 +16,21 @@ Tools:
 - sandbox_read_file: Read file contents from the sandbox
 - sandbox_enable_network: Enable persistent internet access
 - sandbox_disable_network: Disable internet access
+
+Git tools (use 'onit-sandbox setup' for GitHub authentication):
+- sandbox_git_clone: Clone a repository into the sandbox
+- sandbox_git_status: Show working tree status
+- sandbox_git_add: Stage files for commit
+- sandbox_git_commit: Create a commit
+- sandbox_git_pull: Pull from a remote repository
+- sandbox_git_push: Push to a remote repository
+- sandbox_git_branch: List, create, or delete branches
+- sandbox_git_checkout: Switch branches or restore files
+- sandbox_git_log: Show commit history
+- sandbox_git_diff: Show changes between commits/working tree
+- sandbox_git_init: Initialize a new repository
+- sandbox_git_remote: Manage remote repositories
+- sandbox_git_stash: Stash or restore uncommitted changes
 """
 
 from __future__ import annotations
@@ -96,6 +111,13 @@ class SandboxManager:
         self._docker_available: bool | None = None
         self._gpu_available: bool | None = None
         self._gpu_devices: str = DEFAULT_GPU_DEVICES
+
+    @staticmethod
+    def _load_github_token() -> str | None:
+        """Load GitHub token from keychain or file-based fallback."""
+        from onit_sandbox.cli import load_github_token
+
+        return load_github_token()
 
     def _check_docker(self) -> bool:
         """Check if Docker is available and running."""
@@ -279,6 +301,11 @@ class SandboxManager:
             "TRANSFORMERS_CACHE=/home/sandbox/.cache/huggingface/transformers",
         ]
 
+        # Inject GitHub token for git authentication if configured
+        github_token = self._load_github_token()
+        if github_token:
+            cmd.extend(["-e", f"GITHUB_TOKEN={github_token}"])
+
         # Only apply CPU quota if explicitly set (0 = no limit)
         if DEFAULT_CPU_QUOTA > 0:
             cmd.extend(["--cpu-quota", str(DEFAULT_CPU_QUOTA)])
@@ -324,6 +351,10 @@ class SandboxManager:
             # Add passwd entry for the host UID so pwd.getpwuid() works
             self._ensure_passwd_entry(container_id)
 
+            # Configure git credential helper if GitHub token is available
+            if github_token:
+                self._configure_git_credentials(container_id)
+
             # Disconnect from bridge immediately — sandbox is network-isolated
             # by default.  enable_network() will reconnect when needed.
             self.disable_network(container_id)
@@ -362,6 +393,44 @@ class SandboxManager:
                 f"grep -q ':{uid}:' /etc/passwd || "
                 f"echo 'sandbox:x:{uid}:{gid}:sandbox:/home/sandbox:/bin/sh' >> /etc/passwd",
             ],
+            capture_output=True,
+            timeout=10,
+        )
+
+    def _configure_git_credentials(self, container_id: str) -> None:
+        """Configure git inside the container to use the GitHub token.
+
+        Sets up a credential helper script that returns the token from the
+        GITHUB_TOKEN environment variable, and configures git to use it.
+        """
+        # Create a git credential helper script that reads GITHUB_TOKEN env var
+        # and set git config to use it.  Also mark /workspace as safe.
+        setup_script = (
+            "mkdir -p /home/sandbox/.local/bin && "
+            "cat > /home/sandbox/.local/bin/git-credential-github-token << 'SCRIPT'\n"
+            "#!/bin/sh\n"
+            '# Only respond to "get" requests\n'
+            'if [ "$1" != "get" ]; then exit 0; fi\n'
+            "# Read input to check for github.com\n"
+            'while IFS= read -r line; do\n'
+            '  case "$line" in\n'
+            '    host=github.com) MATCH=1 ;;\n'
+            '    "") break ;;\n'
+            "  esac\n"
+            "done\n"
+            '[ "$MATCH" = "1" ] || exit 0\n'
+            'echo "protocol=https"\n'
+            'echo "host=github.com"\n'
+            'echo "username=x-access-token"\n'
+            'echo "password=$GITHUB_TOKEN"\n'
+            'echo ""\n'
+            "SCRIPT\n"
+            "chmod +x /home/sandbox/.local/bin/git-credential-github-token && "
+            "git config --global credential.helper github-token && "
+            "git config --global --add safe.directory /workspace"
+        )
+        subprocess.run(
+            ["docker", "exec", container_id, "sh", "-c", setup_script],
             capture_output=True,
             timeout=10,
         )
@@ -1989,6 +2058,534 @@ async def sandbox_read_file(
                 {"status": "error", "error": str(e)},
                 indent=2,
             )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+# ---------------------------------------------------------------------------
+# Git MCP Tool definitions
+# ---------------------------------------------------------------------------
+
+
+def _run_git_command(
+    command: str,
+    session_id: str | None = None,
+    network: bool = False,
+    timeout: int = 60,
+) -> str:
+    """Run a git command inside the sandbox container.
+
+    Handles container creation, optional network access, and returns
+    a JSON-encoded result dict.
+    """
+    sid = _get_session_id(session_id)
+    data_path = _get_data_path(sid)
+
+    try:
+        container_info = _manager.get_or_create_container(
+            sid, data_path, extra_mounts=DATA_MOUNTS
+        )
+
+        temp_network = False
+        if network and not container_info.network_enabled:
+            temp_network = _manager.enable_network(container_info.container_id)
+
+        try:
+            exit_code, output = _manager.exec_in_container(
+                container_info.container_id,
+                command,
+                timeout=timeout,
+            )
+
+            return json.dumps(
+                {
+                    "status": "ok" if exit_code == 0 else "error",
+                    "session_id": sid,
+                    "output": output[-MAX_OUTPUT_BYTES:],
+                    "returncode": exit_code,
+                },
+                indent=2,
+            )
+        finally:
+            if temp_network:
+                _manager.disable_network(container_info.container_id)
+
+    except DockerNotAvailableError:
+        return json.dumps(
+            {
+                "status": "error",
+                "output": "Docker is not available. "
+                "Please install Docker and ensure it is running.",
+                "returncode": -1,
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.exception("Error in git command: %s", command)
+        return json.dumps(
+            {"status": "error", "output": str(e), "returncode": -1},
+            indent=2,
+        )
+
+
+@mcp.tool(
+    title="Git Clone",
+    description="""Clone a git repository into the sandbox workspace.
+Network is enabled automatically during clone.
+
+- url: Repository URL (HTTPS). For private repos, run 'onit-sandbox setup' first.
+- path: Optional target directory name (relative to /workspace).""",
+)
+async def sandbox_git_clone(
+    url: Annotated[
+        str,
+        Field(description="Repository URL to clone (HTTPS), e.g. 'https://github.com/user/repo.git'."),
+    ],
+    path: Annotated[
+        str | None,
+        Field(description="Target directory name relative to /workspace. Defaults to repo name."),
+    ] = None,
+    branch: Annotated[
+        str | None,
+        Field(description="Branch to clone. Defaults to the remote default branch."),
+    ] = None,
+    depth: Annotated[
+        int | None,
+        Field(description="Create a shallow clone with this many commits. Omit for full history."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cmd = "git clone"
+        if branch:
+            cmd += f" --branch {branch}"
+        if depth and depth > 0:
+            cmd += f" --depth {depth}"
+        cmd += f" {url}"
+        if path:
+            cmd += f" {path}"
+        return _run_git_command(cmd, session_id=session_id, network=True, timeout=300)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Status",
+    description="""Show the working tree status of a git repository in the sandbox.
+
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_status(
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        return _run_git_command(f"{cd}git status", session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Add",
+    description="""Stage files for the next commit.
+
+- files: Space-separated file paths or patterns to stage. Use '.' to stage all changes.
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_add(
+    files: Annotated[
+        str,
+        Field(description="Files to stage, e.g. '.' or 'src/main.py tests/' or '-A'."),
+    ],
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        return _run_git_command(f"{cd}git add {files}", session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Commit",
+    description="""Create a git commit with staged changes.
+
+- message: Commit message.
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.
+- all: If true, automatically stage all modified/deleted files before committing (-a).""",
+)
+async def sandbox_git_commit(
+    message: Annotated[
+        str,
+        Field(description="Commit message."),
+    ],
+    all: Annotated[
+        bool,
+        Field(description="Stage all modified/deleted files before committing (-a flag)."),
+    ] = False,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        # Use heredoc to safely pass the commit message
+        all_flag = " -a" if all else ""
+        cmd = f'{cd}git commit{all_flag} -m "$(cat <<\'COMMITMSG\'\n{message}\nCOMMITMSG\n)"'
+        return _run_git_command(cmd, session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Pull",
+    description="""Pull changes from a remote repository. Network is enabled automatically.
+
+- remote: Remote name (default: origin).
+- branch: Branch to pull. Defaults to current branch.
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_pull(
+    remote: Annotated[
+        str,
+        Field(description="Remote name (default: origin)."),
+    ] = "origin",
+    branch: Annotated[
+        str | None,
+        Field(description="Branch to pull. Defaults to the current tracking branch."),
+    ] = None,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        branch_arg = f" {branch}" if branch else ""
+        return _run_git_command(
+            f"{cd}git pull {remote}{branch_arg}",
+            session_id=session_id,
+            network=True,
+        )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Push",
+    description="""Push commits to a remote repository. Network is enabled automatically.
+For private repos, run 'onit-sandbox setup' to configure GitHub authentication first.
+
+- remote: Remote name (default: origin).
+- branch: Branch to push. Defaults to current branch.
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_push(
+    remote: Annotated[
+        str,
+        Field(description="Remote name (default: origin)."),
+    ] = "origin",
+    branch: Annotated[
+        str | None,
+        Field(description="Branch to push. Defaults to the current branch."),
+    ] = None,
+    set_upstream: Annotated[
+        bool,
+        Field(description="Set upstream tracking reference (-u flag)."),
+    ] = False,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        upstream_flag = " -u" if set_upstream else ""
+        branch_arg = f" {branch}" if branch else ""
+        return _run_git_command(
+            f"{cd}git push{upstream_flag} {remote}{branch_arg}",
+            session_id=session_id,
+            network=True,
+        )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Branch",
+    description="""List, create, or delete branches.
+
+- name: Branch name to create. Omit to list branches.
+- delete: If true, delete the named branch.
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_branch(
+    name: Annotated[
+        str | None,
+        Field(description="Branch name to create. Omit to list all branches."),
+    ] = None,
+    delete: Annotated[
+        bool,
+        Field(description="Delete the named branch instead of creating it."),
+    ] = False,
+    all: Annotated[
+        bool,
+        Field(description="List both local and remote-tracking branches (-a)."),
+    ] = False,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        if name and delete:
+            cmd = f"{cd}git branch -d {name}"
+        elif name:
+            cmd = f"{cd}git branch {name}"
+        else:
+            all_flag = " -a" if all else ""
+            cmd = f"{cd}git branch{all_flag}"
+        return _run_git_command(cmd, session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Checkout",
+    description="""Switch branches or restore working tree files.
+
+- target: Branch name, tag, or commit hash to check out.
+- create: If true, create a new branch and switch to it (-b flag).
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_checkout(
+    target: Annotated[
+        str,
+        Field(description="Branch name, tag, or commit hash to check out."),
+    ],
+    create: Annotated[
+        bool,
+        Field(description="Create a new branch and switch to it (-b flag)."),
+    ] = False,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        create_flag = " -b" if create else ""
+        return _run_git_command(f"{cd}git checkout{create_flag} {target}", session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Log",
+    description="""Show commit history.
+
+- max_count: Maximum number of commits to show (default: 20).
+- oneline: If true, use condensed one-line format.
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_log(
+    max_count: Annotated[
+        int,
+        Field(description="Maximum number of commits to show."),
+    ] = 20,
+    oneline: Annotated[
+        bool,
+        Field(description="Use condensed one-line format (--oneline)."),
+    ] = True,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        oneline_flag = " --oneline" if oneline else ""
+        return _run_git_command(
+            f"{cd}git log -n {max_count}{oneline_flag}",
+            session_id=session_id,
+        )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Diff",
+    description="""Show changes between commits, working tree, and staging area.
+
+- staged: If true, show staged changes (--cached/--staged).
+- target: Compare against a specific commit, branch, or ref.
+- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_diff(
+    staged: Annotated[
+        bool,
+        Field(description="Show only staged changes (--staged)."),
+    ] = False,
+    target: Annotated[
+        str | None,
+        Field(description="Compare against a specific commit, branch, or ref (e.g. 'HEAD~1', 'main')."),
+    ] = None,
+    files: Annotated[
+        str | None,
+        Field(description="Limit diff to specific files (space-separated paths)."),
+    ] = None,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        staged_flag = " --staged" if staged else ""
+        target_arg = f" {target}" if target else ""
+        files_arg = f" -- {files}" if files else ""
+        return _run_git_command(
+            f"{cd}git diff{staged_flag}{target_arg}{files_arg}",
+            session_id=session_id,
+        )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Init",
+    description="""Initialize a new git repository in the sandbox workspace.
+
+- path: Directory to initialize (relative to /workspace). Defaults to /workspace.""",
+)
+async def sandbox_git_init(
+    path: Annotated[
+        str | None,
+        Field(description="Directory to initialize relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    default_branch: Annotated[
+        str | None,
+        Field(description="Name for the initial branch (e.g. 'main'). Defaults to git's default."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        target = f"/workspace/{path}" if path else "/workspace"
+        branch_flag = f" --initial-branch={default_branch}" if default_branch else ""
+        return _run_git_command(f"git init{branch_flag} {target}", session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Remote",
+    description="""Manage remote repositories.
+
+- action: 'list' (default), 'add', or 'remove'.
+- name: Remote name (required for add/remove).
+- url: Remote URL (required for add).""",
+)
+async def sandbox_git_remote(
+    action: Annotated[
+        str,
+        Field(description="Action: 'list', 'add', or 'remove'."),
+    ] = "list",
+    name: Annotated[
+        str | None,
+        Field(description="Remote name (required for add/remove)."),
+    ] = None,
+    url: Annotated[
+        str | None,
+        Field(description="Remote URL (required for add)."),
+    ] = None,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        if action == "add":
+            if not name or not url:
+                return json.dumps(
+                    {"status": "error", "output": "Both 'name' and 'url' are required for 'add'."},
+                    indent=2,
+                )
+            cmd = f"{cd}git remote add {name} {url}"
+        elif action == "remove":
+            if not name:
+                return json.dumps(
+                    {"status": "error", "output": "'name' is required for 'remove'."},
+                    indent=2,
+                )
+            cmd = f"{cd}git remote remove {name}"
+        else:
+            cmd = f"{cd}git remote -v"
+        return _run_git_command(cmd, session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Stash",
+    description="""Stash or restore uncommitted changes.
+
+- action: 'push' (default), 'pop', 'list', 'apply', or 'drop'.
+- message: Optional message for stash push.""",
+)
+async def sandbox_git_stash(
+    action: Annotated[
+        str,
+        Field(description="Action: 'push' (default), 'pop', 'list', 'apply', or 'drop'."),
+    ] = "push",
+    message: Annotated[
+        str | None,
+        Field(description="Optional message for stash push."),
+    ] = None,
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        cd = f"cd /workspace/{path} && " if path else ""
+        if action == "push" and message:
+            cmd = f'{cd}git stash push -m "{message}"'
+        else:
+            cmd = f"{cd}git stash {action}"
+        return _run_git_command(cmd, session_id=session_id)
 
     return await _run_with_progress(ctx, _impl)
 

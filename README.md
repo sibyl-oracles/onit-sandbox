@@ -5,7 +5,7 @@
 [![CI](https://github.com/sibyl-oracles/onit-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/sibyl-oracles/onit-sandbox/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-A Docker-based code execution sandbox [MCP server](https://modelcontextprotocol.io/) for safe Python execution. Gives LLM agents an isolated environment where they can install packages, run code, and produce artifacts — without touching the host system. Designed for AI model training, evaluation, and data pipelines.
+A Docker-based code execution sandbox [MCP server](https://modelcontextprotocol.io/) for safe Python execution. Gives LLM agents an isolated environment where they can install packages, run code, manage git repositories, and produce artifacts — without touching the host system. Designed for AI model training, evaluation, and data pipelines.
 
 ## Why onit-sandbox?
 
@@ -13,6 +13,7 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 
 - **Install any package** — `pip install numpy matplotlib torch` just works
 - **Run full projects** — execute scripts, run tests, build simulations
+- **Git operations** — clone, commit, push, pull, branch — all inside the sandbox
 - **Mount data volumes** — bind host directories (datasets, models) into the sandbox
 - **Data pipelines** — upload files, run training, read metrics, download artifacts
 - **Stay secure** — containers are resource-limited, network-isolated, and non-root
@@ -30,6 +31,7 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 │  │  upload_file / download_file   │  │
 │  │  list_files / sandbox_status   │  │
 │  │  enable_network / disable_net  │  │
+│  │  git_clone / git_commit / …    │  │
 │  └──────────┬─────────────────────┘  │
 │             │ Docker CLI              │
 │  ┌──────────▼─────────────────────┐  │
@@ -76,6 +78,9 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 ```bash
 # From PyPI
 pip install onit-sandbox
+
+# With OS keychain support for secure GitHub token storage
+pip install onit-sandbox[keyring]
 
 # Or from source
 git clone https://github.com/sibyl-oracles/onit-sandbox.git
@@ -175,6 +180,30 @@ onit-sandbox stop
 ```
 
 The server runs on `http://0.0.0.0:18205/mcp` by default (streamable-http transport).
+
+### Step 4 — Configure GitHub authentication (optional)
+
+If you need git operations against private repositories (clone, push, pull), store a GitHub Personal Access Token:
+
+```bash
+# Interactive setup — prompts for your token (input is hidden)
+onit-sandbox setup
+
+# Check current token status
+onit-sandbox setup status
+
+# Remove stored token
+onit-sandbox setup remove
+```
+
+**Token storage:** The token is stored in the OS keychain (macOS Keychain, GNOME Keyring, KWallet, or Windows Credential Manager) when the `keyring` package is installed. Otherwise it falls back to `~/.onit-sandbox/github_token` with `0o600` permissions.
+
+```bash
+# Install keyring for OS keychain support
+pip install keyring
+```
+
+Create a token at [github.com/settings/tokens](https://github.com/settings/tokens) with the `repo` scope (for private repos) or `public_repo` (for public repos only).
 
 ## MCP Tools
 
@@ -277,6 +306,179 @@ Check sandbox state — container health, Python version, installed packages, di
 
 Toggle persistent internet access. Use `enable_network` before downloading datasets or calling APIs, then `disable_network` to restore isolation.
 
+### Git Tools
+
+All git tools operate inside the sandbox container. For private repos, run `onit-sandbox setup` first to configure authentication. Network is automatically enabled for operations that need it (clone, pull, push).
+
+#### `sandbox_git_clone`
+
+Clone a repository into the sandbox workspace.
+
+```json
+{
+  "url": "https://github.com/user/repo.git",
+  "branch": "main",
+  "depth": 1,
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_status`
+
+Show working tree status.
+
+```json
+{
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_add`
+
+Stage files for the next commit.
+
+```json
+{
+  "files": ".",
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_commit`
+
+Create a commit with staged changes.
+
+```json
+{
+  "message": "Add training script",
+  "all": true,
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_pull`
+
+Pull changes from a remote.
+
+```json
+{
+  "remote": "origin",
+  "branch": "main",
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_push`
+
+Push commits to a remote.
+
+```json
+{
+  "remote": "origin",
+  "branch": "main",
+  "set_upstream": true,
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_branch`
+
+List, create, or delete branches.
+
+```json
+{
+  "name": "feature/training",
+  "delete": false,
+  "all": false,
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_checkout`
+
+Switch branches or restore files.
+
+```json
+{
+  "target": "feature/training",
+  "create": true,
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_log`
+
+Show commit history.
+
+```json
+{
+  "max_count": 10,
+  "oneline": true,
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_diff`
+
+Show changes between commits or working tree.
+
+```json
+{
+  "staged": false,
+  "target": "HEAD~1",
+  "files": "src/",
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_init`
+
+Initialize a new git repository.
+
+```json
+{
+  "path": "new-project",
+  "default_branch": "main"
+}
+```
+
+#### `sandbox_git_remote`
+
+Manage remote repositories.
+
+```json
+{
+  "action": "add",
+  "name": "origin",
+  "url": "https://github.com/user/repo.git",
+  "path": "my-repo"
+}
+```
+
+#### `sandbox_git_stash`
+
+Stash or restore uncommitted changes.
+
+```json
+{
+  "action": "push",
+  "message": "WIP: training changes",
+  "path": "my-repo"
+}
+```
+
+### Example: Git Workflow in the Sandbox
+
+```
+1. sandbox_git_clone(url="https://github.com/user/ml-project.git")
+2. sandbox_git_checkout(target="experiment/new-loss", create=true, path="ml-project")
+3. sandbox_write_file(file_path="ml-project/train.py", content="...")
+4. sandbox_run_code(command="cd ml-project && python train.py")
+5. sandbox_git_add(files=".", path="ml-project")
+6. sandbox_git_commit(message="Add new loss function", path="ml-project")
+7. sandbox_git_push(set_upstream=true, path="ml-project")
+```
+
 ## Data Mounts
 
 Mount host directories into the sandbox for direct access to datasets, model weights, or shared storage. This avoids copying large files through `upload_file`.
@@ -346,6 +548,15 @@ onit-sandbox start [OPTIONS]
   --gpu          GPU device(s) to expose to containers
                  Examples: "0", "1", "2", "0,1", "all" (default)
                  Overrides CUDA_VISIBLE_DEVICES and SANDBOX_GPU_DEVICES env vars
+
+onit-sandbox setup [ACTION]
+
+  (no action)    Interactive prompt to store a GitHub token
+  status         Show whether a token is configured and where it's stored
+  remove         Delete the stored token from keychain and/or file
+
+onit-sandbox stop       Stop the running server
+onit-sandbox status     Check server status
 ```
 
 ### Environment Variables
@@ -430,10 +641,11 @@ cleanup_sandbox(session_id="my-session")
 | Filesystem | Container isolation — only workspace and explicit mounts are accessible |
 | User | Non-root execution as `sandbox` (UID 1000) |
 | Resources | Memory (64 GB), CPU (no limit), PIDs (4096), shared memory (16 GB) |
-| Network | Disabled by default — enabled only during `install_packages` or on request |
+| Network | Disabled by default — enabled only during `install_packages`, git clone/push/pull, or on request |
 | Lifecycle | Containers auto-removed on stop (`--rm` flag) |
 | GPU | Optional NVIDIA GPU passthrough when available |
 | Data mounts | Default to read-only; read-write must be explicitly requested |
+| Credentials | GitHub tokens stored in OS keychain (with `keyring`) or file with `0o600` permissions; injected via env var, never written to disk inside containers |
 
 ### What's Blocked
 
@@ -506,6 +718,10 @@ mypy src/                # Type check
 | DataLoader crashes with shared memory error | Increase shared memory: `SANDBOX_SHM_SIZE=32g` or reduce `num_workers` |
 | OOM during training | Increase memory limit: `SANDBOX_MEMORY_LIMIT=128g`, or use quantization (`bitsandbytes`) / PEFT (`peft`) |
 | Old packages after rebuild | Stop running sessions and restart — containers use the image from when they were created |
+| Git clone/push fails with 401 | Run `onit-sandbox setup` to configure a GitHub token |
+| Git push fails with 403 | Token may lack `repo` scope — create a new token with the correct permissions |
+| `onit-sandbox setup status` shows "file" storage | Install `keyring` for OS keychain storage: `pip install keyring` |
+| Git operations hang | Network may not be reaching GitHub — check `sandbox_enable_network` and DNS settings |
 
 ## License
 
