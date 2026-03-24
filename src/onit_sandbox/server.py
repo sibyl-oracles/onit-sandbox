@@ -45,7 +45,7 @@ DEFAULT_GPU_DEVICES = os.getenv(
 # Data mount configuration.
 # Comma-separated list of "host_path:container_path[:mode]" entries.
 # mode is "ro" (read-only, default) or "rw" (read-write).
-# Example: SANDBOX_DATA_MOUNTS="/data:/data:ro,/models:/models:rw"
+# Example: SANDBOX_DATA_MOUNTS="/data:/data:ro,/checkpoints:/checkpoints:rw"
 DEFAULT_DATA_MOUNTS = os.getenv("SANDBOX_DATA_MOUNTS", "")
 
 # Maximum bytes of stdout/stderr returned per tool call.

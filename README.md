@@ -39,7 +39,7 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 │  │  - PyTorch + scientific stack  │  │
 │  │  - ML/data pipeline packages   │  │
 │  │  - Full pip access             │  │
-│  │  - /workspace bind-mounted     │  │
+│  │  - /home/sandbox (home dir)     │  │
 │  │  - /data mount (optional)      │  │
 │  │  - Shared pip cache volume     │  │
 │  │  - CPU/mem/network limits      │  │
@@ -161,7 +161,7 @@ onit-sandbox start
 onit-sandbox start --foreground
 
 # Start with data volume mounts
-onit-sandbox start --mount /data:/data:ro --mount /models:/models:rw
+onit-sandbox start --mount /data:/data:ro --mount /checkpoints:/checkpoints:rw
 
 # Start with a specific GPU (e.g. GPU 2)
 onit-sandbox start --gpu 2
@@ -501,7 +501,7 @@ onit-sandbox start \
 
 ```bash
 # Comma-separated "host:container:mode" entries
-export SANDBOX_DATA_MOUNTS="/data:/data:ro,/models:/models:rw"
+export SANDBOX_DATA_MOUNTS="/data:/data:ro,/checkpoints:/checkpoints:rw"
 onit-sandbox start
 ```
 
@@ -541,7 +541,7 @@ onit-sandbox start [OPTIONS]
   --transport    streamable-http, sse, or stdio (default: streamable-http)
   --foreground   Run in foreground
   --verbose      Enable verbose logging
-  --data-path    Host data directory, mounted as /workspace inside the sandbox (default: /tmp/onit/data)
+  --data-path    Host data directory, mounted as /home/sandbox inside the sandbox (default: /tmp/onit/data)
   --mount        Mount host directory into sandbox (repeatable)
                  Format: HOST_PATH:CONTAINER_PATH[:MODE]
                  MODE is "ro" (default) or "rw"
@@ -598,7 +598,7 @@ docker:
   max_timeout: 86400     # 24 hours
   max_output_bytes: 50000
   data_mounts: []
-  # data_mounts: ["/data:/data:ro", "/models:/models:rw"]
+  # data_mounts: ["/data:/data:ro", "/checkpoints:/checkpoints:rw"]
 ```
 
 ## Integration with OnIt
@@ -624,7 +624,7 @@ run(
     host="0.0.0.0",
     port=18205,
     options={
-        "data_mounts": ["/data:/data:ro", "/models:/models:rw"],
+        "data_mounts": ["/data:/data:ro", "/checkpoints:/checkpoints:rw"],
     },
 )
 
@@ -638,7 +638,7 @@ cleanup_sandbox(session_id="my-session")
 
 | Layer | Protection |
 |-------|-----------|
-| Filesystem | Container isolation — only workspace and explicit mounts are accessible |
+| Filesystem | Container isolation — only home directory and explicit mounts are accessible |
 | User | Non-root execution as `sandbox` (UID 1000) |
 | Resources | Memory (64 GB), CPU (no limit), PIDs (4096), shared memory (16 GB) |
 | Network | Disabled by default — enabled only during `install_packages`, git clone/push/pull, or on request |
@@ -649,7 +649,7 @@ cleanup_sandbox(session_id="my-session")
 
 ### What's Blocked
 
-- Direct host filesystem access (only workspace and configured mounts)
+- Direct host filesystem access (only home directory and configured mounts)
 - Root access inside container
 - Network access during code execution (by default)
 - Unlimited resource consumption
@@ -657,7 +657,7 @@ cleanup_sandbox(session_id="my-session")
 ### What's Allowed
 
 - Full PyPI access during `install_packages` or with network enabled
-- Read/write to mounted workspace
+- Read/write to home directory
 - Read access to data mounts (write if `rw` mode)
 - Python execution with any installed packages
 - Shell commands within resource limits
@@ -708,7 +708,7 @@ mypy src/                # Type check
 |---------|----------|
 | Docker not available | Install Docker and start the daemon (`sudo systemctl start docker` on Linux, or open Docker Desktop on macOS) |
 | Sandbox image not found | Build locally with `cd docker && ./build.sh` or pull from GHCR |
-| Permission denied on workspace | `chmod -R 777 /path/to/workspace` |
+| Permission denied on home directory | `chmod -R 777 /path/to/data` |
 | Command timeout | Increase timeout: `run_code(command="...", timeout=86400)` |
 | Port already in use | Use `--port` flag: `onit-sandbox start --port 18206` |
 | `gpu_available` is false despite having a GPU | Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) — Docker needs it to expose GPUs to containers. See Prerequisites above. |

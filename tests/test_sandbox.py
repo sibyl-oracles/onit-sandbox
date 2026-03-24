@@ -149,7 +149,7 @@ class TestSandboxWithDocker:
     def test_files_created_detection(self, sandbox_session):
         """Test that files_created detects new files after execution."""
         result = _run(
-            sandbox_run_code(command="echo 'test content' > /workspace/testfile.txt"),
+            sandbox_run_code(command="echo 'test content' > /home/sandbox/testfile.txt"),
         )
         data = json.loads(result)
 
@@ -196,7 +196,7 @@ class TestSandboxWithDocker:
         session_id, tmp_path = sandbox_session
 
         # Create a file inside the sandbox
-        _run(sandbox_run_code(command="echo 'download test' > /workspace/dl_test.txt"))
+        _run(sandbox_run_code(command="echo 'download test' > /home/sandbox/dl_test.txt"))
 
         # Download it — returns base64 content
         result = _run(sandbox_download_file(path="dl_test.txt"))

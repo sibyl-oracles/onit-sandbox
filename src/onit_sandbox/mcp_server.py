@@ -3,7 +3,7 @@ Sandbox MCP Server — tool definitions for safe code execution.
 
 Provides an isolated Docker-based sandbox for developing, running, and testing
 Python projects without affecting the host system. Each session gets its own
-container with resource limits, network isolation, and a shared workspace.
+container with resource limits, network isolation, and a shared home directory.
 
 Tools:
 - sandbox_install_packages: Install Python packages in the sandbox
@@ -16,6 +16,7 @@ Tools:
 - sandbox_read_file: Read file contents from the sandbox
 - sandbox_enable_network: Enable persistent internet access
 - sandbox_disable_network: Disable internet access
+- sandbox_filesystem_info: Explain the sandbox filesystem layout and mounts
 
 Git tools (use 'onit-sandbox setup' for GitHub authentication):
 - sandbox_git_clone: Clone a repository into the sandbox
@@ -235,7 +236,7 @@ class SandboxManager:
 
         Args:
             session_id: Unique session identifier.
-            data_path: Host path for the /workspace volume.
+            data_path: Host path for the /home/sandbox volume.
             extra_mounts: Additional volume mounts, each a dict with keys
                 ``host``, ``container``, and ``mode`` (``ro`` or ``rw``).
         """
@@ -268,11 +269,11 @@ class SandboxManager:
             "--name",
             container_name,
             "--volume",
-            f"{os.path.abspath(data_path)}:/workspace:rw",
+            f"{os.path.abspath(data_path)}:/home/sandbox:rw",
             "--volume",
             f"{pip_cache}:/home/sandbox/.cache/pip:rw",
             "--workdir",
-            "/workspace",
+            "/home/sandbox",
             "--memory",
             DEFAULT_MEMORY_LIMIT,
             "--pids-limit",
@@ -404,7 +405,7 @@ class SandboxManager:
         GITHUB_TOKEN environment variable, and configures git to use it.
         """
         # Create a git credential helper script that reads GITHUB_TOKEN env var
-        # and set git config to use it.  Also mark /workspace as safe.
+        # and set git config to use it.  Also mark /home/sandbox as safe.
         setup_script = (
             "mkdir -p /home/sandbox/.local/bin && "
             "cat > /home/sandbox/.local/bin/git-credential-github-token << 'SCRIPT'\n"
@@ -427,7 +428,7 @@ class SandboxManager:
             "SCRIPT\n"
             "chmod +x /home/sandbox/.local/bin/git-credential-github-token && "
             "git config --global credential.helper github-token && "
-            "git config --global --add safe.directory /workspace"
+            "git config --global --add safe.directory /home/sandbox"
         )
         subprocess.run(
             ["docker", "exec", container_id, "sh", "-c", setup_script],
@@ -472,7 +473,7 @@ class SandboxManager:
     def _build_exec_cmd(
         container_id: str,
         command: str,
-        workdir: str = "/workspace",
+        workdir: str = "/home/sandbox",
         env: dict[str, str] | None = None,
     ) -> list[str]:
         """Build a ``docker exec`` command list."""
@@ -511,7 +512,7 @@ class SandboxManager:
         container_id: str,
         command: str,
         timeout: int = DEFAULT_TIMEOUT,
-        workdir: str = "/workspace",
+        workdir: str = "/home/sandbox",
         env: dict[str, str] | None = None,
         split_output: bool = False,
     ) -> tuple[int, str] | tuple[int, str, str]:
@@ -538,7 +539,7 @@ class SandboxManager:
         container_id: str,
         command: str,
         timeout: int | None = DEFAULT_TIMEOUT,
-        workdir: str = "/workspace",
+        workdir: str = "/home/sandbox",
         env: dict[str, str] | None = None,
         on_output: Callable[[str], None] | None = None,
     ) -> tuple[int, str, str]:
@@ -772,15 +773,15 @@ def _get_data_path(session_id: str | None = None) -> str:
 
 
 def _list_workspace_files(container_id: str) -> set[str]:
-    """List files in /workspace to detect newly created files."""
+    """List files in /home/sandbox to detect newly created files."""
     exit_code, output = _manager.exec_in_container(
         container_id,
-        "find /workspace -maxdepth 8 -type f 2>/dev/null",
+        "find /home/sandbox -maxdepth 8 -not -path '*/\\.*' -type f 2>/dev/null",
         timeout=10,
     )
     if exit_code == 0:
         return {
-            line.replace("/workspace/", "", 1)
+            line.replace("/home/sandbox/", "", 1)
             for line in output.strip().split("\n")
             if line.strip()
         }
@@ -922,7 +923,7 @@ async def sandbox_install_packages(
 @mcp.tool(
     title="Run Code",
     description="""Execute a shell command in the isolated sandbox container. Only sandbox-local
-paths (e.g. /workspace) are accessible — host paths do not exist here.
+paths (e.g. /home/sandbox) are accessible — host paths do not exist here.
 No internet by default. Output is streamed in real time.
 
 - command: Shell command to run (e.g. "python train.py --data-dir /data").
@@ -1068,16 +1069,16 @@ async def sandbox_run_code(
     title="Write File to Sandbox",
     description="""Write content to a file in the sandbox.
 Parent directories are created automatically.
-Relative paths resolve from /workspace.
+Relative paths resolve from /home/sandbox.
 
-- path: Destination path in the sandbox (relative to /workspace or absolute).
+- path: Destination path in the sandbox (relative to /home/sandbox or absolute).
 - content: File content (text, or base64 when encoding="base64").
 - encoding: "utf-8" (default) or "base64" for binary files.""",
 )
 async def sandbox_write_file(
     path: Annotated[
         str | None,
-        Field(description="Destination path in the sandbox (relative to /workspace or absolute)."),
+        Field(description="Destination path in the sandbox (relative to /home/sandbox or absolute)."),
     ] = None,
     content: Annotated[
         str | None, Field(description="File content (text, or base64 when encoding='base64').")
@@ -1108,7 +1109,7 @@ async def sandbox_write_file(
 
             # Normalise to absolute path inside container
             if not path.startswith("/"):
-                container_path = f"/workspace/{path}"
+                container_path = f"/home/sandbox/{path}"
             else:
                 container_path = path
 
@@ -1173,7 +1174,7 @@ async def sandbox_write_file(
                     "exec",
                     "-i",
                     "-w",
-                    "/workspace",
+                    "/home/sandbox",
                     container_info.container_id,
                     "sh",
                     "-c",
@@ -1261,12 +1262,12 @@ async def sandbox_write_file(
     description="""List files in the sandbox.
 Use absolute paths to explore data mounts (e.g. "/data").
 
-- path: Directory to list, relative to /workspace or absolute (default ".")
+- path: Directory to list, relative to /home/sandbox or absolute (default ".")
 - max_depth: Recursion depth 1-10 (default 3)""",
 )
 async def sandbox_list_files(
     path: Annotated[
-        str, Field(description="Directory to list (relative to /workspace or absolute).")
+        str, Field(description="Directory to list (relative to /home/sandbox or absolute).")
     ] = ".",
     max_depth: Annotated[int, Field(description="Recursion depth, 1-10.")] = 3,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
@@ -1283,7 +1284,7 @@ async def sandbox_list_files(
 
             # Normalise to absolute path inside container
             if not path.startswith("/"):
-                container_path = f"/workspace/{path}"
+                container_path = f"/home/sandbox/{path}"
             else:
                 container_path = path
 
@@ -1299,7 +1300,7 @@ async def sandbox_list_files(
             files: list[str] = []
             if exit_code == 0 and output.strip():
                 files = [
-                    line.replace("/workspace/", "", 1)
+                    line.replace("/home/sandbox/", "", 1)
                     for line in output.strip().split("\n")
                     if line.strip()
                 ]
@@ -1407,7 +1408,7 @@ async def sandbox_get_status(
             # Get disk usage
             exit_code, du_output = _manager.exec_in_container(
                 info.container_id,
-                "du -sm /workspace 2>/dev/null | awk '{print $1}'",
+                "du -sm /home/sandbox 2>/dev/null | awk '{print $1}'",
                 timeout=10,
             )
             try:
@@ -1533,12 +1534,12 @@ async def sandbox_disable_network(
     title="Download File from Sandbox",
     description="""Copy a file from the sandbox to the server filesystem.
 
-- path: Path in sandbox (relative to /workspace or absolute).
+- path: Path in sandbox (relative to /home/sandbox or absolute).
 - dest: Absolute server path to save to (default: session downloads directory).""",
 )
 async def sandbox_download_file(
     path: Annotated[
-        str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")
+        str | None, Field(description="Path in sandbox (relative to /home/sandbox or absolute).")
     ] = None,
     dest: Annotated[
         str | None,
@@ -1560,7 +1561,7 @@ async def sandbox_download_file(
         try:
             # Normalise path to absolute
             if not path.startswith("/"):
-                container_path = f"/workspace/{path}"
+                container_path = f"/home/sandbox/{path}"
             else:
                 container_path = path
 
@@ -1688,7 +1689,7 @@ Provide exactly one of src, data, or content.
 - content: Plain UTF-8 text content (requires filename).
 - filename: Name for the file when using data or content.
 - dest: Destination in sandbox (relative or absolute;
-  default: /workspace/<filename>).""",
+  default: /home/sandbox/<filename>).""",
 )
 async def sandbox_upload_file(
     src: Annotated[str | None, Field(description="Absolute server path to copy from.")] = None,
@@ -1703,7 +1704,7 @@ async def sandbox_upload_file(
     ] = None,
     dest: Annotated[
         str | None,
-        Field(description="Destination in sandbox (relative to /workspace or absolute)."),
+        Field(description="Destination in sandbox (relative to /home/sandbox or absolute)."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     data_path: Annotated[str | None, Field(description="Agent data directory.")] = None,
@@ -1746,9 +1747,9 @@ async def sandbox_upload_file(
 
                 # Determine destination inside the container
                 if dest:
-                    container_dest = dest if dest.startswith("/") else f"/workspace/{dest}"
+                    container_dest = dest if dest.startswith("/") else f"/home/sandbox/{dest}"
                 else:
-                    container_dest = f"/workspace/{filename}"
+                    container_dest = f"/home/sandbox/{filename}"
 
                 # Ensure parent directory exists in container
                 parent_dir = os.path.dirname(container_dest)
@@ -1803,9 +1804,9 @@ async def sandbox_upload_file(
 
                 # Determine destination inside the container
                 if dest:
-                    container_dest = dest if dest.startswith("/") else f"/workspace/{dest}"
+                    container_dest = dest if dest.startswith("/") else f"/home/sandbox/{dest}"
                 else:
-                    container_dest = f"/workspace/{filename}"
+                    container_dest = f"/home/sandbox/{filename}"
 
                 # Ensure parent directory exists in container
                 parent_dir = os.path.dirname(container_dest)
@@ -1876,9 +1877,9 @@ async def sandbox_upload_file(
 
             # Determine destination inside the container
             if dest:
-                container_dest = dest if dest.startswith("/") else f"/workspace/{dest}"
+                container_dest = dest if dest.startswith("/") else f"/home/sandbox/{dest}"
             else:
-                container_dest = f"/workspace/{os.path.basename(abs_src)}"
+                container_dest = f"/home/sandbox/{os.path.basename(abs_src)}"
 
             # Ensure parent directory exists in container
             parent_dir = os.path.dirname(container_dest)
@@ -1957,13 +1958,13 @@ async def sandbox_upload_file(
     description="""Read file contents from the sandbox.
 For large binary files, use sandbox_download_file.
 
-- path: Path in sandbox (relative to /workspace or absolute)
+- path: Path in sandbox (relative to /home/sandbox or absolute)
 - max_bytes: Max bytes to read (default 100000, cap 1MB)
 - offset: Byte offset to start from (default 0, useful for tailing logs)""",
 )
 async def sandbox_read_file(
     path: Annotated[
-        str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")
+        str | None, Field(description="Path in sandbox (relative to /home/sandbox or absolute).")
     ] = None,
     max_bytes: Annotated[int, Field(description="Max bytes to read (cap 1MB).")] = 100000,
     offset: Annotated[
@@ -1986,7 +1987,7 @@ async def sandbox_read_file(
 
             # Normalise to absolute path inside container
             if not path.startswith("/"):
-                container_path = f"/workspace/{path}"
+                container_path = f"/home/sandbox/{path}"
             else:
                 container_path = path
 
@@ -2128,7 +2129,7 @@ def _run_git_command(
 Network is enabled automatically during clone.
 
 - url: Repository URL (HTTPS). For private repos, run 'onit-sandbox setup' first.
-- path: Optional target directory name (relative to /workspace).""",
+- path: Optional target directory name (relative to /home/sandbox).""",
 )
 async def sandbox_git_clone(
     url: Annotated[
@@ -2139,7 +2140,7 @@ async def sandbox_git_clone(
     ],
     path: Annotated[
         str | None,
-        Field(description="Target directory name relative to /workspace. Defaults to repo name."),
+        Field(description="Target directory name relative to /home/sandbox. Defaults to repo name."),
     ] = None,
     branch: Annotated[
         str | None,
@@ -2170,18 +2171,18 @@ async def sandbox_git_clone(
     title="Git Status",
     description="""Show the working tree status of a git repository in the sandbox.
 
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_status(
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         return _run_git_command(f"{cd}git status", session_id=session_id)
 
     return await _run_with_progress(ctx, _impl)
@@ -2192,7 +2193,7 @@ async def sandbox_git_status(
     description="""Stage files for the next commit.
 
 - files: Space-separated file paths or patterns to stage. Use '.' to stage all changes.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_add(
     files: Annotated[
@@ -2201,13 +2202,13 @@ async def sandbox_git_add(
     ],
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         return _run_git_command(f"{cd}git add {files}", session_id=session_id)
 
     return await _run_with_progress(ctx, _impl)
@@ -2218,7 +2219,7 @@ async def sandbox_git_add(
     description="""Create a git commit with staged changes.
 
 - message: Commit message.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.
 - all: If true, automatically stage all modified/deleted files before committing (-a).""",
 )
 async def sandbox_git_commit(
@@ -2232,13 +2233,13 @@ async def sandbox_git_commit(
     ] = False,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         # Use heredoc to safely pass the commit message
         all_flag = " -a" if all else ""
         cmd = f"{cd}git commit{all_flag} -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
@@ -2253,7 +2254,7 @@ async def sandbox_git_commit(
 
 - remote: Remote name (default: origin).
 - branch: Branch to pull. Defaults to current branch.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_pull(
     remote: Annotated[
@@ -2266,13 +2267,13 @@ async def sandbox_git_pull(
     ] = None,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         branch_arg = f" {branch}" if branch else ""
         return _run_git_command(
             f"{cd}git pull {remote}{branch_arg}",
@@ -2290,7 +2291,7 @@ For private repos, run 'onit-sandbox setup' to configure GitHub authentication f
 
 - remote: Remote name (default: origin).
 - branch: Branch to push. Defaults to current branch.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_push(
     remote: Annotated[
@@ -2307,13 +2308,13 @@ async def sandbox_git_push(
     ] = False,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         upstream_flag = " -u" if set_upstream else ""
         branch_arg = f" {branch}" if branch else ""
         return _run_git_command(
@@ -2331,7 +2332,7 @@ async def sandbox_git_push(
 
 - name: Branch name to create. Omit to list branches.
 - delete: If true, delete the named branch.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_branch(
     name: Annotated[
@@ -2348,13 +2349,13 @@ async def sandbox_git_branch(
     ] = False,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         if name and delete:
             cmd = f"{cd}git branch -d {name}"
         elif name:
@@ -2373,7 +2374,7 @@ async def sandbox_git_branch(
 
 - target: Branch name, tag, or commit hash to check out.
 - create: If true, create a new branch and switch to it (-b flag).
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_checkout(
     target: Annotated[
@@ -2386,13 +2387,13 @@ async def sandbox_git_checkout(
     ] = False,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         create_flag = " -b" if create else ""
         return _run_git_command(f"{cd}git checkout{create_flag} {target}", session_id=session_id)
 
@@ -2405,7 +2406,7 @@ async def sandbox_git_checkout(
 
 - max_count: Maximum number of commits to show (default: 20).
 - oneline: If true, use condensed one-line format.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_log(
     max_count: Annotated[
@@ -2418,13 +2419,13 @@ async def sandbox_git_log(
     ] = True,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         oneline_flag = " --oneline" if oneline else ""
         return _run_git_command(
             f"{cd}git log -n {max_count}{oneline_flag}",
@@ -2440,7 +2441,7 @@ async def sandbox_git_log(
 
 - staged: If true, show staged changes (--cached/--staged).
 - target: Compare against a specific commit, branch, or ref.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
+- path: Directory of the git repo (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_diff(
     staged: Annotated[
@@ -2459,13 +2460,13 @@ async def sandbox_git_diff(
     ] = None,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         staged_flag = " --staged" if staged else ""
         target_arg = f" {target}" if target else ""
         files_arg = f" -- {files}" if files else ""
@@ -2481,13 +2482,13 @@ async def sandbox_git_diff(
     title="Git Init",
     description="""Initialize a new git repository in the sandbox workspace.
 
-- path: Directory to initialize (relative to /workspace). Defaults to /workspace.""",
+- path: Directory to initialize (relative to /home/sandbox). Defaults to /home/sandbox.""",
 )
 async def sandbox_git_init(
     path: Annotated[
         str | None,
         Field(
-            description="Directory to initialize relative to /workspace. Defaults to /workspace."
+            description="Directory to initialize relative to /home/sandbox. Defaults to /home/sandbox."
         ),
     ] = None,
     default_branch: Annotated[
@@ -2498,7 +2499,7 @@ async def sandbox_git_init(
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        target = f"/workspace/{path}" if path else "/workspace"
+        target = f"/home/sandbox/{path}" if path else "/home/sandbox"
         branch_flag = f" --initial-branch={default_branch}" if default_branch else ""
         return _run_git_command(f"git init{branch_flag} {target}", session_id=session_id)
 
@@ -2528,13 +2529,13 @@ async def sandbox_git_remote(
     ] = None,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         if action == "add":
             if not name or not url:
                 return json.dumps(
@@ -2574,13 +2575,13 @@ async def sandbox_git_stash(
     ] = None,
     path: Annotated[
         str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
     ] = None,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
+        cd = f"cd /home/sandbox/{path} && " if path else ""
         if action == "push" and message:
             cmd = f'{cd}git stash push -m "{message}"'
         else:
@@ -2588,6 +2589,60 @@ async def sandbox_git_stash(
         return _run_git_command(cmd, session_id=session_id)
 
     return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Sandbox Filesystem Info",
+    description="""Explains the filesystem layout inside the sandbox container.
+Returns a description of key directories, their purpose, and current mount configuration.
+Call this tool first to orient yourself before working with files in the sandbox.""",
+)
+async def sandbox_filesystem_info(
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    mounts_info = []
+    for m in DATA_MOUNTS:
+        mounts_info.append(
+            f"  {m['container']}  (mounted from host, mode: {m['mode']})"
+        )
+
+    mounts_section = "\n".join(mounts_info) if mounts_info else "  (none configured)"
+
+    info = f"""\
+=== Sandbox Container Filesystem Layout ===
+
+/home/sandbox       Default home directory and working directory. This is
+                    where you should create, edit, and run code. All relative
+                    paths resolve here.
+  .cache/pip        Shared pip cache — persists across sessions for faster
+                    package installs.
+  .cache/huggingface  HuggingFace cache (models, datasets, tokenizers).
+  .local/bin        User-installed executables (on PATH).
+
+/data               Optional data directory. Typically mounted read-only for
+                    datasets, CSVs, or other input files the agent should
+                    read but not modify.
+
+/tmp                Temporary files. Cleared on container restart.
+
+--- Environment ---
+USER:               sandbox (uid 1000)
+HOME:               /home/sandbox
+HF_HOME:            /home/sandbox/.cache/huggingface
+PATH includes:      /home/sandbox/.local/bin
+
+--- Active Data Mounts ---
+{mounts_section}
+
+--- Tips ---
+- Use /home/sandbox for all code and output files.
+- Install packages with sandbox_install_packages (pip).
+- Network is disabled by default; use sandbox_enable_network or the
+  network=true flag on sandbox_run_code to access the internet.
+- Use sandbox_list_files to explore directory contents.
+"""
+    return json.dumps({"status": "ok", "filesystem_info": info}, indent=2)
 
 
 # ---------------------------------------------------------------------------

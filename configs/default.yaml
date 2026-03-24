@@ -35,7 +35,7 @@ docker:
 
   # Data volume mounts — mount host directories into the sandbox.
   # Each entry is "host_path:container_path:mode" where mode is "ro" or "rw".
-  # Example: ["/data:/data:ro", "/models:/models:rw"]
+  # Example: ["/data:/data:ro", "/checkpoints:/checkpoints:rw"]
   data_mounts: []
 
 # Logging configuration

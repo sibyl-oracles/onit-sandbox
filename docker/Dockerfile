@@ -95,9 +95,9 @@ RUN pip install --no-cache-dir \
 # flash-attn requires CUDA at build time; skip gracefully if unavailable
 RUN pip install --no-cache-dir flash-attn --no-build-isolation || true
 
-# Set up workspace, data, and model cache directories
-RUN mkdir -p /workspace /data /models \
-    && chown sandbox:sandbox /workspace /data /models
+# Set up data directory
+RUN mkdir -p /data \
+    && chown sandbox:sandbox /data
 
 # Ensure pip cache, HuggingFace cache, and user-install dirs are writable
 RUN mkdir -p /home/sandbox/.cache/pip /home/sandbox/.cache/huggingface /home/sandbox/.local \
@@ -112,7 +112,7 @@ ENV HF_HOME=/home/sandbox/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/home/sandbox/.cache/huggingface/transformers
 
 # Set working directory
-WORKDIR /workspace
+WORKDIR /home/sandbox
 
 # Default command - keep container running
 CMD ["sleep", "infinity"]
