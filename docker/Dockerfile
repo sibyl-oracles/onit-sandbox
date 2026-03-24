@@ -52,6 +52,7 @@ RUN pip install --no-cache-dir \
     datasets \
     transformers \
     safetensors \
+    tensorflow \
     tensorboard \
     tqdm \
     pyyaml \

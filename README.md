@@ -90,7 +90,7 @@ pip install -e .
 
 ### Step 2 — Build (or pull) the Docker image
 
-The sandbox image comes pre-loaded with PyTorch (CUDA), the common scientific Python stack, large-scale training libraries, and ML/data pipeline packages so agents can start training immediately.
+The sandbox image comes pre-loaded with PyTorch (CUDA), TensorFlow, the common scientific Python stack, large-scale training libraries, and ML/data pipeline packages so agents can start training immediately.
 
 **Option A — Pull from GHCR:**
 
@@ -137,6 +137,7 @@ Pre-installed packages:
 | datasets | Hugging Face datasets |
 | transformers | Hugging Face transformers |
 | safetensors | Safe model serialization |
+| tensorflow | Google's deep learning framework |
 | tensorboard | Training visualization |
 | tqdm | Progress bars |
 | pyyaml | YAML parsing |
