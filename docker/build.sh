@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "Building onit-sandbox Docker image..."
-docker build -t onit-sandbox:latest .
+docker buildx build --load -t onit-sandbox:latest .
 
 echo "Done! Image 'onit-sandbox:latest' is ready."
 echo ""

@@ -90,7 +90,7 @@ pip install -e .
 
 ### Step 2 — Build (or pull) the Docker image
 
-The sandbox image comes pre-loaded with PyTorch (CUDA), TensorFlow, the common scientific Python stack, large-scale training libraries, and ML/data pipeline packages so agents can start training immediately.
+The sandbox image comes pre-loaded with PyTorch (CUDA), the common scientific Python stack, audio/speech processing tools, large-scale training libraries, and ML/data pipeline packages so agents can start training immediately.
 
 **Option A — Pull from GHCR:**
 
@@ -111,7 +111,7 @@ chmod +x build.sh
 >
 > ```bash
 > # Force a clean rebuild (no layer cache)
-> docker build --no-cache -t onit-sandbox:latest docker/
+> docker buildx build --no-cache --load -t onit-sandbox:latest docker/
 >
 > # Or use the build script (uses layer cache by default)
 > cd docker && ./build.sh
@@ -126,9 +126,10 @@ Pre-installed packages:
 | torchvision | Vision models and transforms |
 | torchaudio | Audio processing |
 | **Scientific stack** | |
-| numpy | Numerical computing |
+| numpy (1.26.4) | Numerical computing |
 | matplotlib | Plotting and visualization |
-| scipy | Scientific computing |
+| scipy (1.13.0) | Scientific computing |
+| Cython (3.0.10) | C-extensions for Python |
 | pandas | Data manipulation |
 | scikit-learn | Machine learning |
 | sympy | Symbolic mathematics |
@@ -137,12 +138,19 @@ Pre-installed packages:
 | datasets | Hugging Face datasets |
 | transformers | Hugging Face transformers |
 | safetensors | Safe model serialization |
-| tensorflow | Google's deep learning framework |
-| tensorboard | Training visualization |
+| tensorboard (2.16.2) | Training visualization |
 | tqdm | Progress bars |
 | pyyaml | YAML parsing |
 | jsonlines | JSONL file handling |
 | pillow | Image processing |
+| **Audio & speech** | |
+| phonemizer (3.2.1) | Grapheme-to-phoneme conversion |
+| librosa (0.10.1) | Audio analysis |
+| soundfile (0.12.1) | Audio file I/O |
+| pyloudnorm | Loudness normalization (ITU-R BS.1770) |
+| utmos | MOS prediction for speech |
+| openai-whisper | Speech recognition |
+| jiwer | Word/character error rate metrics |
 | **Large-scale training** | |
 | accelerate | Distributed training (Hugging Face) |
 | deepspeed | Memory-efficient distributed training |

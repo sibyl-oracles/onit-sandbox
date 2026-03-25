@@ -1,12 +1,18 @@
-FROM python:3.12-slim
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 LABEL org.opencontainers.image.title="onit-sandbox"
 LABEL org.opencontainers.image.description="Isolated Python execution sandbox for MCP agents"
 LABEL org.opencontainers.image.source="https://github.com/sibyl-oracles/onit-sandbox"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-# Install system dependencies and common development toolchain
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.12 (ships with 24.04), pip, and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-venv \
+    python3-dev \
+    python3-pip \
     espeak-ng \
     build-essential \
     cmake \
@@ -21,14 +27,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libhdf5-dev \
     libopenblas-dev \
     liblapack-dev \
+    libsndfile1 \
+    ffmpeg \
     gfortran \
     git \
     curl \
     wget \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
-RUN useradd -m -u 1000 sandbox
+# Create non-root user for security (remove existing UID 1000 user if present)
+RUN if getent passwd 1000 >/dev/null 2>&1; then userdel -r "$(getent passwd 1000 | cut -d: -f1)"; fi \
+    && useradd -m -u 1000 sandbox
+
+# Allow pip install system-wide (PEP 668 — safe in a container)
+RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
 
 # Install PyTorch ecosystem (CUDA) — largest packages first to maximise
 # layer-cache hits when the smaller scientific stack changes.
@@ -39,9 +52,10 @@ RUN pip install --no-cache-dir \
 
 # Install common scientific packages in system Python
 RUN pip install --no-cache-dir \
-    numpy \
+    numpy==1.26.4 \
     matplotlib \
-    scipy \
+    scipy==1.13.0 \
+    Cython==3.0.10 \
     pandas \
     scikit-learn \
     sympy \
@@ -52,8 +66,7 @@ RUN pip install --no-cache-dir \
     datasets \
     transformers \
     safetensors \
-    tensorflow \
-    tensorboard \
+    tensorboard==2.16.2 \
     tqdm \
     pyyaml \
     jsonlines \
@@ -85,6 +98,15 @@ RUN pip install --no-cache-dir \
     wandb \
     huggingface-hub \
     evaluate
+
+# Install audio and speech packages
+RUN pip install --no-cache-dir \
+    phonemizer \
+    librosa \
+    soundfile \
+    pyloudnorm \
+    openai-whisper \
+    jiwer
 
 # Install packages for large-scale training
 RUN pip install --no-cache-dir \
