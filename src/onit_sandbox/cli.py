@@ -11,7 +11,6 @@ import argparse
 import getpass
 import os
 import signal
-import stat
 import subprocess
 import sys
 import time
@@ -25,6 +24,7 @@ STATE_DIR = Path.home() / ".onit-sandbox"
 PID_FILE = STATE_DIR / "server.pid"
 LOG_FILE = STATE_DIR / "server.log"
 GITHUB_TOKEN_FILE = STATE_DIR / "github_token"
+HF_TOKEN_FILE = STATE_DIR / "hf_token"
 
 
 def _ensure_state_dir() -> None:
@@ -198,11 +198,12 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GitHub token management
+# Keychain-based token management
 # ---------------------------------------------------------------------------
 
 _KEYRING_SERVICE = "onit-sandbox"
-_KEYRING_USERNAME = "github-token"
+_KEYRING_GITHUB = "github-token"
+_KEYRING_HF = "hf-token"
 
 
 def _keyring_available() -> bool:
@@ -212,166 +213,287 @@ def _keyring_available() -> bool:
         from keyring.backends.fail import Keyring as FailKeyring
 
         backend = keyring.get_keyring()
-        # fail backend means no real keychain is available
         return not isinstance(backend, FailKeyring)
     except Exception:
         return False
 
 
-def _save_token_to_keyring(token: str) -> bool:
-    """Store token in the OS keychain. Returns True on success."""
+def _require_keyring() -> None:
+    """Raise if keyring is not available."""
+    if not _keyring_available():
+        print(
+            "Error: OS keychain is required but not available.\n"
+            "Install the 'keyring' package:  pip install keyring\n"
+            "On headless Linux you may also need a backend like "
+            "'keyrings.alt' or 'SecretStorage'."
+        )
+        sys.exit(1)
+
+
+def _save_to_keyring(username: str, token: str) -> bool:
+    """Store a token in the OS keychain. Returns True on success."""
     try:
         import keyring
 
-        keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, token)
+        keyring.set_password(_KEYRING_SERVICE, username, token)
         return True
     except Exception:
         return False
 
 
-def _load_token_from_keyring() -> str | None:
-    """Load token from the OS keychain, or None."""
+def _load_from_keyring(username: str) -> str | None:
+    """Load a token from the OS keychain, or None."""
     try:
         import keyring
 
-        token = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+        token = keyring.get_password(_KEYRING_SERVICE, username)
         return token if token else None
     except Exception:
         return None
 
 
-def _delete_token_from_keyring() -> bool:
-    """Delete token from the OS keychain. Returns True on success."""
+def _delete_from_keyring(username: str) -> bool:
+    """Delete a token from the OS keychain. Returns True on success."""
     try:
         import keyring
 
-        keyring.delete_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+        keyring.delete_password(_KEYRING_SERVICE, username)
         return True
     except Exception:
         return False
 
 
-def _save_token_to_file(token: str) -> None:
-    """Store token in a file with restricted permissions (fallback)."""
-    _ensure_state_dir()
-    GITHUB_TOKEN_FILE.write_text(token)
-    GITHUB_TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600
-
-
-def _load_token_from_file() -> str | None:
-    """Load token from the file-based store, or None."""
-    if GITHUB_TOKEN_FILE.exists():
+def _load_from_file(path: Path) -> str | None:
+    """Load a token from a legacy file-based store, or None."""
+    if path.exists():
         try:
-            token = GITHUB_TOKEN_FILE.read_text().strip()
+            token = path.read_text().strip()
             return token if token else None
         except OSError:
             return None
     return None
 
 
-def _delete_token_from_file() -> bool:
-    """Delete token file. Returns True if it existed."""
-    if GITHUB_TOKEN_FILE.exists():
-        GITHUB_TOKEN_FILE.unlink()
+def _delete_file(path: Path) -> bool:
+    """Delete a legacy token file. Returns True if it existed."""
+    if path.exists():
+        path.unlink()
         return True
     return False
 
 
+def _migrate_file_to_keyring(path: Path, username: str) -> None:
+    """If a token exists in a legacy file, migrate it to keyring and delete the file."""
+    token = _load_from_file(path)
+    if token and _keyring_available():
+        if _save_to_keyring(username, token):
+            _delete_file(path)
+
+
+# --- GitHub token helpers ---------------------------------------------------
+
+
 def load_github_token() -> str | None:
-    """Load the stored GitHub token.
+    """Load the stored GitHub token from the OS keychain.
 
-    Checks the OS keychain first, then falls back to the file-based store.
+    Auto-migrates any legacy file-based token into keychain.
     """
-    if _keyring_available():
-        token = _load_token_from_keyring()
-        if token:
-            return token
-    return _load_token_from_file()
+    _migrate_file_to_keyring(GITHUB_TOKEN_FILE, _KEYRING_GITHUB)
+    return _load_from_keyring(_KEYRING_GITHUB)
 
 
-def _save_github_token(token: str) -> str:
-    """Save token to the best available backend.
-
-    Returns a human-readable description of where it was stored.
-    """
-    if _keyring_available():
-        if _save_token_to_keyring(token):
-            # Also remove any leftover plaintext file
-            _delete_token_from_file()
-            return "OS keychain"
-    # Fallback to file
-    _save_token_to_file(token)
-    return f"{GITHUB_TOKEN_FILE} (mode 600)"
+def _save_github_token(token: str) -> None:
+    """Save GitHub token to the OS keychain."""
+    _require_keyring()
+    if not _save_to_keyring(_KEYRING_GITHUB, token):
+        print("Error: Failed to save GitHub token to OS keychain.")
+        sys.exit(1)
+    _delete_file(GITHUB_TOKEN_FILE)  # clean up any legacy file
 
 
 def _delete_github_token() -> bool:
-    """Delete token from all backends. Returns True if anything was deleted."""
-    deleted = False
-    if _keyring_available():
-        deleted = _delete_token_from_keyring() or deleted
-    deleted = _delete_token_from_file() or deleted
+    """Delete GitHub token from keychain (and any legacy file)."""
+    deleted = _delete_from_keyring(_KEYRING_GITHUB)
+    deleted = _delete_file(GITHUB_TOKEN_FILE) or deleted
     return deleted
 
 
-def _token_storage_location() -> str | None:
-    """Return a description of where the token is currently stored, or None."""
-    if _keyring_available():
-        if _load_token_from_keyring():
-            return "OS keychain"
-    if _load_token_from_file():
-        return f"file ({GITHUB_TOKEN_FILE})"
-    return None
+# --- HuggingFace token helpers -----------------------------------------------
+
+
+def load_hf_token() -> str | None:
+    """Load the stored HuggingFace token from the OS keychain.
+
+    Auto-migrates any legacy file-based token into keychain.
+    """
+    _migrate_file_to_keyring(HF_TOKEN_FILE, _KEYRING_HF)
+    return _load_from_keyring(_KEYRING_HF)
+
+
+def _save_hf_token(token: str) -> None:
+    """Save HuggingFace token to the OS keychain."""
+    _require_keyring()
+    if not _save_to_keyring(_KEYRING_HF, token):
+        print("Error: Failed to save HuggingFace token to OS keychain.")
+        sys.exit(1)
+    _delete_file(HF_TOKEN_FILE)  # clean up any legacy file
+
+
+def _delete_hf_token() -> bool:
+    """Delete HuggingFace token from keychain (and any legacy file)."""
+    deleted = _delete_from_keyring(_KEYRING_HF)
+    deleted = _delete_file(HF_TOKEN_FILE) or deleted
+    return deleted
+
+
+def _cmd_setup_show() -> None:
+    """Display all current setup configuration."""
+    from onit_sandbox.server import (
+        DEFAULT_CPU_QUOTA,
+        DEFAULT_DATA_MOUNTS,
+        DEFAULT_GPU_DEVICES,
+        DEFAULT_MEMORY_LIMIT,
+        DEFAULT_PIP_CACHE_PATH,
+        DEFAULT_PIDS_LIMIT,
+        DEFAULT_SHM_SIZE,
+        DEFAULT_TIMEOUT,
+        FALLBACK_IMAGE,
+        INSTALL_TIMEOUT,
+        MAX_OUTPUT_BYTES,
+        MAX_TIMEOUT,
+        SANDBOX_IMAGE,
+    )
+
+    # --- Tokens --------------------------------------------------------------
+    print("Tokens")
+    print("=" * 40)
+
+    keyring_ok = _keyring_available()
+    if not keyring_ok:
+        print("  (!) OS keychain is not available")
+
+    gh_token = load_github_token()
+    if gh_token:
+        masked = gh_token[:4] + "..." + gh_token[-4:] if len(gh_token) > 8 else "****"
+        print(f"  GitHub:       {masked}  (keychain)")
+    else:
+        print("  GitHub:       not configured")
+
+    hf_token = load_hf_token()
+    if hf_token:
+        masked = hf_token[:4] + "..." + hf_token[-4:] if len(hf_token) > 8 else "****"
+        print(f"  HuggingFace:  {masked}  (keychain)")
+    else:
+        print("  HuggingFace:  not configured")
+
+    # --- Docker / sandbox ----------------------------------------------------
+    print()
+    print("Docker / Sandbox")
+    print("=" * 40)
+    print(f"  Image:            {SANDBOX_IMAGE}")
+    print(f"  Fallback image:   {FALLBACK_IMAGE}")
+    print(f"  Memory limit:     {DEFAULT_MEMORY_LIMIT}")
+    cpu = "no limit" if DEFAULT_CPU_QUOTA == 0 else str(DEFAULT_CPU_QUOTA)
+    print(f"  CPU quota:        {cpu}")
+    print(f"  PIDs limit:       {DEFAULT_PIDS_LIMIT}")
+    print(f"  Shared memory:    {DEFAULT_SHM_SIZE}")
+    print(f"  GPU devices:      {DEFAULT_GPU_DEVICES}")
+
+    # --- Timeouts ------------------------------------------------------------
+    print()
+    print("Timeouts")
+    print("=" * 40)
+    print(f"  Default:          {DEFAULT_TIMEOUT}s")
+    print(f"  Max:              {MAX_TIMEOUT}s")
+    print(f"  Install:          {INSTALL_TIMEOUT}s")
+
+    # --- Paths / mounts ------------------------------------------------------
+    print()
+    print("Paths / Mounts")
+    print("=" * 40)
+    print(f"  Pip cache:        {DEFAULT_PIP_CACHE_PATH}")
+    print(f"  Max output:       {MAX_OUTPUT_BYTES} bytes")
+    if DEFAULT_DATA_MOUNTS:
+        print(f"  Data mounts:      {DEFAULT_DATA_MOUNTS}")
+    else:
+        print("  Data mounts:      none")
 
 
 def cmd_setup(args: argparse.Namespace) -> None:
-    """Interactive setup for GitHub authentication."""
+    """Interactive setup for GitHub and HuggingFace authentication."""
     _ensure_state_dir()
 
+    # --show flag takes priority over positional action
+    if getattr(args, "show", False):
+        _cmd_setup_show()
+        return
+
     action = getattr(args, "setup_action", None)
+    target = getattr(args, "setup_target", None) or "all"
 
     if action == "remove":
-        if _delete_github_token():
-            print("GitHub token removed.")
-        else:
-            print("No GitHub token configured.")
+        if target in ("all", "github"):
+            if _delete_github_token():
+                print("GitHub token removed.")
+            else:
+                print("No GitHub token configured.")
+        if target in ("all", "huggingface"):
+            if _delete_hf_token():
+                print("HuggingFace token removed.")
+            else:
+                print("No HuggingFace token configured.")
         return
 
     if action == "status":
-        token = load_github_token()
-        if token:
-            masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "****"
-            location = _token_storage_location()
+        if not _keyring_available():
+            print(
+                "Warning: OS keychain is not available.\n"
+                "Install 'keyring' package:  pip install keyring\n"
+            )
+
+        # GitHub status
+        gh_token = load_github_token()
+        if gh_token:
+            masked = gh_token[:4] + "..." + gh_token[-4:] if len(gh_token) > 8 else "****"
             print(f"GitHub token is configured: {masked}")
-            print(f"Storage: {location}")
-            if not _keyring_available():
-                print(
-                    "Tip: Install 'keyring' package for OS keychain storage "
-                    "(pip install keyring)"
-                )
+            print("  Storage: OS keychain")
         else:
-            print("No GitHub token configured. Run: onit-sandbox setup")
+            print("No GitHub token configured.")
+
+        # HuggingFace status
+        hf_token = load_hf_token()
+        if hf_token:
+            masked = hf_token[:4] + "..." + hf_token[-4:] if len(hf_token) > 8 else "****"
+            print(f"HuggingFace token is configured: {masked}")
+            print("  Storage: OS keychain")
+        else:
+            print("No HuggingFace token configured.")
         return
 
-    # Default: configure token
+    # Default: interactive configuration
+    if target in ("all", "github"):
+        _setup_github_token()
+
+    if target in ("all", "huggingface"):
+        if target == "all":
+            print()  # separator between sections
+        _setup_hf_token()
+
+
+def _setup_github_token() -> None:
+    """Interactive setup for GitHub token."""
+    _require_keyring()
+
     print("GitHub Authentication Setup")
     print("=" * 40)
     print()
-    print("This stores a GitHub Personal Access Token (PAT) for git")
-    print("operations inside the sandbox (clone, push, pull, etc.).")
-    print()
-    if _keyring_available():
-        print("Storage: OS keychain (secure)")
-    else:
-        print(
-            "Storage: encrypted file (~/.onit-sandbox/github_token)\n"
-            "Tip: Install 'keyring' for OS keychain support (pip install keyring)"
-        )
+    print("This stores a GitHub Personal Access Token (PAT) in the OS")
+    print("keychain for git operations inside the sandbox.")
     print()
     print("Create a token at: https://github.com/settings/tokens")
     print("Required scopes: repo (for private repos), or public_repo")
     print()
 
-    # Check for existing token
     existing = load_github_token()
     if existing:
         masked = existing[:4] + "..." + existing[-4:] if len(existing) > 8 else "****"
@@ -381,13 +503,11 @@ def cmd_setup(args: argparse.Namespace) -> None:
             print("Keeping existing token.")
             return
 
-    # Read token (hidden input)
     token = getpass.getpass("GitHub token (input hidden): ").strip()
     if not token:
-        print("No token provided. Aborting.")
+        print("No token provided. Skipping GitHub setup.")
         return
 
-    # Validate token format (basic check)
     if not (
         token.startswith("ghp_")
         or token.startswith("gho_")
@@ -400,14 +520,54 @@ def cmd_setup(args: argparse.Namespace) -> None:
         )
         confirm = input("Save anyway? [y/N]: ").strip().lower()
         if confirm not in ("y", "yes"):
-            print("Aborting.")
+            print("Aborting GitHub token setup.")
             return
 
-    location = _save_github_token(token)
-
-    print()
-    print(f"Token saved to {location}")
+    _save_github_token(token)
+    print("GitHub token saved to OS keychain.")
     print("Git operations in the sandbox will now use this token for authentication.")
+
+
+def _setup_hf_token() -> None:
+    """Interactive setup for HuggingFace token."""
+    _require_keyring()
+
+    print("HuggingFace Authentication Setup")
+    print("=" * 40)
+    print()
+    print("This stores a HuggingFace API token in the OS keychain for")
+    print("accessing models, datasets, and other resources inside the sandbox.")
+    print()
+    print("Create a token at: https://huggingface.co/settings/tokens")
+    print()
+
+    existing = load_hf_token()
+    if existing:
+        masked = existing[:4] + "..." + existing[-4:] if len(existing) > 8 else "****"
+        print(f"Current token: {masked}")
+        confirm = input("Replace existing token? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Keeping existing token.")
+            return
+
+    token = getpass.getpass("HuggingFace token (input hidden): ").strip()
+    if not token:
+        print("No token provided. Skipping HuggingFace setup.")
+        return
+
+    if not token.startswith("hf_"):
+        print(
+            "Warning: Token doesn't look like a HuggingFace token "
+            "(expected hf_* prefix)."
+        )
+        confirm = input("Save anyway? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Aborting HuggingFace token setup.")
+            return
+
+    _save_hf_token(token)
+    print("HuggingFace token saved to OS keychain.")
+    print("HuggingFace operations in the sandbox will now use this token.")
 
 
 # ---------------------------------------------------------------------------
@@ -470,14 +630,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     # setup
     setup_p = subparsers.add_parser(
-        "setup", help="Configure GitHub authentication for git operations"
+        "setup", help="Configure authentication tokens (GitHub, HuggingFace)"
     )
     setup_p.add_argument(
         "setup_action",
         nargs="?",
         default=None,
         choices=["remove", "status"],
-        help="Optional action: 'remove' to delete token, 'status' to check config",
+        help="Optional action: 'remove' to delete token(s), 'status' to check config",
+    )
+    setup_p.add_argument(
+        "--show",
+        action="store_true",
+        default=False,
+        help="Display current setup configuration",
+    )
+    setup_p.add_argument(
+        "--target",
+        dest="setup_target",
+        default="all",
+        choices=["github", "huggingface", "all"],
+        help="Which token to configure (default: all)",
     )
 
     return parser

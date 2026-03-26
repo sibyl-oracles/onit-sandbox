@@ -25,13 +25,13 @@ DEFAULT_PIP_CACHE_PATH = os.getenv("SANDBOX_PIP_CACHE_PATH", "/tmp/onit/pip-cach
 # Docker configuration constants
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "onit-sandbox:latest")
 FALLBACK_IMAGE = os.getenv("FALLBACK_IMAGE", "python:3.12-slim")
-DEFAULT_MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "64g")
+DEFAULT_MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "128g")
 DEFAULT_CPU_QUOTA = int(os.getenv("SANDBOX_CPU_QUOTA", "0"))  # 0 = no limit
-DEFAULT_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "4096"))
-DEFAULT_TIMEOUT = int(os.getenv("SANDBOX_DEFAULT_TIMEOUT", "600"))
-MAX_TIMEOUT = int(os.getenv("SANDBOX_MAX_TIMEOUT", "86400"))  # 24 hours
-INSTALL_TIMEOUT = int(os.getenv("SANDBOX_INSTALL_TIMEOUT", "600"))
-DEFAULT_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "16g")
+DEFAULT_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "8192"))
+DEFAULT_TIMEOUT = int(os.getenv("SANDBOX_DEFAULT_TIMEOUT", "86400"))
+MAX_TIMEOUT = int(os.getenv("SANDBOX_MAX_TIMEOUT", "604800"))  # 7 days
+INSTALL_TIMEOUT = int(os.getenv("SANDBOX_INSTALL_TIMEOUT", "1800"))
+DEFAULT_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "32g")
 
 # GPU device selection.
 # Specify which GPU device(s) to expose to containers.

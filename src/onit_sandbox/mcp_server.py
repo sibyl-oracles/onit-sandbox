@@ -120,6 +120,13 @@ class SandboxManager:
 
         return load_github_token()
 
+    @staticmethod
+    def _load_hf_token() -> str | None:
+        """Load HuggingFace token from keychain or file-based fallback."""
+        from onit_sandbox.cli import load_hf_token
+
+        return load_hf_token()
+
     def _check_docker(self) -> bool:
         """Check if Docker is available and running."""
         if self._docker_available is not None:
@@ -300,12 +307,31 @@ class SandboxManager:
             "HF_HOME=/home/sandbox/.cache/huggingface",
             "-e",
             "TRANSFORMERS_CACHE=/home/sandbox/.cache/huggingface/transformers",
+            "-e",
+            "CUDA_DEVICE_ORDER=PCI_BUS_ID",
+            "-e",
+            "NCCL_P2P_DISABLE=0",
+            "-e",
+            "NCCL_IB_DISABLE=1",
+            "-e",
+            "TORCH_CUDNN_V8_API_ENABLED=1",
+            "-e",
+            "TOKENIZERS_PARALLELISM=true",
+            "-e",
+            f"MKL_NUM_THREADS={os.cpu_count() or 4}",
+            "-e",
+            f"NUMEXPR_MAX_THREADS={os.cpu_count() or 4}",
         ]
 
         # Inject GitHub token for git authentication if configured
         github_token = self._load_github_token()
         if github_token:
             cmd.extend(["-e", f"GITHUB_TOKEN={github_token}"])
+
+        # Inject HuggingFace token if configured
+        hf_token = self._load_hf_token()
+        if hf_token:
+            cmd.extend(["-e", f"HF_TOKEN={hf_token}"])
 
         # Only apply CPU quota if explicitly set (0 = no limit)
         if DEFAULT_CPU_QUOTA > 0:
@@ -428,13 +454,20 @@ class SandboxManager:
             "SCRIPT\n"
             "chmod +x /home/sandbox/.local/bin/git-credential-github-token && "
             "git config --global credential.helper github-token && "
-            "git config --global --add safe.directory /home/sandbox"
+            "git config --global --add safe.directory '*'"
         )
-        subprocess.run(
+        result = subprocess.run(
             ["docker", "exec", container_id, "sh", "-c", setup_script],
             capture_output=True,
+            text=True,
             timeout=10,
         )
+        if result.returncode != 0:
+            logger.warning(
+                "Failed to configure git credentials in container %s: %s",
+                container_id,
+                result.stderr,
+            )
 
     def get_or_create_container(
         self,
@@ -575,9 +608,13 @@ class SandboxManager:
         def _cleanup_proc(
             proc: subprocess.Popen[str], t_out: threading.Thread, t_err: threading.Thread
         ) -> None:
-            """Kill process, close pipes, and join reader threads."""
-            proc.kill()
-            proc.wait()
+            """Gracefully terminate process, then force kill if needed."""
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             if proc.stdout:
                 proc.stdout.close()
             if proc.stderr:
@@ -2084,6 +2121,17 @@ def _run_git_command(
         temp_network = False
         if network and not container_info.network_enabled:
             temp_network = _manager.enable_network(container_info.container_id)
+            if not temp_network:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "session_id": sid,
+                        "output": "Failed to enable network for git operation. "
+                        "The container could not connect to the network.",
+                        "returncode": -1,
+                    },
+                    indent=2,
+                )
 
         try:
             exit_code, output = _manager.exec_in_container(
@@ -2092,9 +2140,24 @@ def _run_git_command(
                 timeout=timeout,
             )
 
+            # Detect authentication failures that git may not surface clearly
+            status = "ok" if exit_code == 0 else "error"
+            lower_output = output.lower()
+            if exit_code != 0 and (
+                "authentication" in lower_output
+                or "could not read username" in lower_output
+                or "permission denied" in lower_output
+                or "403" in output
+                or "401" in output
+            ):
+                output += (
+                    "\n\nHint: GitHub authentication may not be configured. "
+                    "Run 'onit-sandbox setup' on the host to store a GitHub token."
+                )
+
             return json.dumps(
                 {
-                    "status": "ok" if exit_code == 0 else "error",
+                    "status": status,
                     "session_id": sid,
                     "output": output[-MAX_OUTPUT_BYTES:],
                     "returncode": exit_code,
@@ -2317,11 +2380,29 @@ async def sandbox_git_push(
         cd = f"cd /home/sandbox/{path} && " if path else ""
         upstream_flag = " -u" if set_upstream else ""
         branch_arg = f" {branch}" if branch else ""
-        return _run_git_command(
-            f"{cd}git push{upstream_flag} {remote}{branch_arg}",
+        # Use --porcelain for machine-readable output and 2>&1 to capture
+        # progress/errors from stderr
+        result = _run_git_command(
+            f"{cd}git push --porcelain{upstream_flag} {remote}{branch_arg} 2>&1",
             session_id=session_id,
             network=True,
+            timeout=120,
         )
+        # Parse the result to add clarity about what happened
+        parsed = json.loads(result)
+        if parsed.get("status") == "ok":
+            output = parsed.get("output", "")
+            if "rejected" in output:
+                parsed["status"] = "error"
+                parsed["output"] = output + (
+                    "\n\nPush was rejected by the remote. "
+                    "You may need to pull first or force push."
+                )
+            elif "up to date" in output.lower() or "[up to date]" in output:
+                parsed["output"] = output + (
+                    "\n\nNothing was pushed — the remote already has these commits."
+                )
+        return json.dumps(parsed, indent=2)
 
     return await _run_with_progress(ctx, _impl)
 
@@ -2587,6 +2668,76 @@ async def sandbox_git_stash(
         else:
             cmd = f"{cd}git stash {action}"
         return _run_git_command(cmd, session_id=session_id)
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
+    title="Git Auth Status",
+    description="""Check whether GitHub authentication is configured in the sandbox.
+Verifies the credential helper and token availability. Call this before push/pull
+to private repos if you encounter authentication errors.""",
+)
+async def sandbox_git_auth_status(
+    path: Annotated[
+        str | None,
+        Field(description="Git repo directory relative to /home/sandbox. Defaults to /home/sandbox."),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
+
+        try:
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
+
+            cd = f"cd /home/sandbox/{path} && " if path else ""
+            # Check: 1) credential helper configured, 2) GITHUB_TOKEN env var set,
+            # 3) helper script exists
+            check_script = (
+                f"{cd}"
+                "echo '=== Credential Helper ===' && "
+                "git config --global credential.helper && "
+                "echo '=== Token Available ===' && "
+                '([ -n "$GITHUB_TOKEN" ] && echo "yes (${#GITHUB_TOKEN} chars)" || echo "no") && '
+                "echo '=== Helper Script ===' && "
+                "([ -x /home/sandbox/.local/bin/git-credential-github-token ] && echo 'exists' || echo 'missing') && "
+                "echo '=== Git User Config ===' && "
+                "git config --global user.name 2>/dev/null || echo '(not set)' && "
+                "git config --global user.email 2>/dev/null || echo '(not set)'"
+            )
+            exit_code, output = _manager.exec_in_container(
+                container_info.container_id,
+                check_script,
+                timeout=10,
+            )
+
+            # Determine overall auth readiness
+            has_token = "yes (" in output
+            has_helper = "exists" in output
+            auth_ready = has_token and has_helper
+
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "session_id": sid,
+                    "auth_configured": auth_ready,
+                    "details": output.strip(),
+                    "hint": None
+                    if auth_ready
+                    else "GitHub token not configured. Run 'onit-sandbox setup' on the host to store a GitHub Personal Access Token.",
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps(
+                {"status": "error", "output": str(e)},
+                indent=2,
+            )
 
     return await _run_with_progress(ctx, _impl)
 

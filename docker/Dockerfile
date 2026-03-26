@@ -43,12 +43,15 @@ RUN if getent passwd 1000 >/dev/null 2>&1; then userdel -r "$(getent passwd 1000
 # Allow pip install system-wide (PEP 668 — safe in a container)
 RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
 
-# Install PyTorch ecosystem (CUDA) — largest packages first to maximise
-# layer-cache hits when the smaller scientific stack changes.
+# Install PyTorch ecosystem (CUDA 12.8) — pinned to match the host driver.
+# The container base image is CUDA 12.8.1; the host driver (570.x) supports
+# up to CUDA 12.8.  Using the cu128 index ensures PyTorch's bundled CUDA
+# runtime stays within what the driver can handle.
 RUN pip install --no-cache-dir \
     torch \
     torchvision \
-    torchaudio
+    torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
 
 # Install common scientific packages in system Python
 RUN pip install --no-cache-dir \
@@ -133,6 +136,13 @@ ENV PATH="/home/sandbox/.local/bin:${PATH}"
 # Point HuggingFace cache to a persistent-friendly location
 ENV HF_HOME=/home/sandbox/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/home/sandbox/.cache/huggingface/transformers
+# CUDA and training optimization defaults
+ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
+ENV NCCL_P2P_DISABLE=0
+ENV NCCL_IB_DISABLE=1
+ENV TORCH_CUDNN_V8_API_ENABLED=1
+ENV TOKENIZERS_PARALLELISM=true
+ENV PYTHONUNBUFFERED=1
 
 # Set working directory
 WORKDIR /home/sandbox

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_sandbox.py -x -q)",
+      "Bash(python -c \"from onit_sandbox.server import DEFAULT_MEMORY_LIMIT, DEFAULT_PIDS_LIMIT, DEFAULT_TIMEOUT, MAX_TIMEOUT, INSTALL_TIMEOUT, DEFAULT_SHM_SIZE; print\\(f''Memory: {DEFAULT_MEMORY_LIMIT}, PIDs: {DEFAULT_PIDS_LIMIT}, Timeout: {DEFAULT_TIMEOUT}, Max: {MAX_TIMEOUT}, Install: {INSTALL_TIMEOUT}, SHM: {DEFAULT_SHM_SIZE}''\\)\")",
+      "Bash(python -c \"from onit_sandbox.mcp_server import SandboxManager; print\\(''mcp_server imports OK''\\)\")",
+      "Bash(python -c \"from onit_sandbox.cli import load_hf_token, load_github_token, build_parser; p = build_parser\\(\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"from onit_sandbox.cli import cmd_setup; print\\(''OK''\\)\")",
+      "Bash(python -m onit_sandbox.cli setup --show)",
+      "Bash(python -c \"from keyrings.alt.file import EncryptedKeyring; print\\(EncryptedKeyring.priority\\)\")",
+      "Bash(nvidia-smi)",
+      "Bash(docker run:*)"
+    ]
+  }
+}
