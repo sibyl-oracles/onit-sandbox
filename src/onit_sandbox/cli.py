@@ -606,9 +606,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="HOST:CONTAINER[:MODE]",
         help=(
             "Mount a host directory into the sandbox container. "
-            "MODE is 'ro' (read-only, default) or 'rw'. "
+            "MODE is 'rw' (read-write, default) or 'ro' (read-only). "
             "Can be specified multiple times. "
-            "Example: --mount /data:/data:ro --mount /checkpoints:/checkpoints:rw"
+            "Example: --mount /data:/data --mount /reference:/reference:ro"
         ),
     )
     start_p.add_argument(

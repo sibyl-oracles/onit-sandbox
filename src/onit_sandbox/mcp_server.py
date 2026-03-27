@@ -16,6 +16,7 @@ Tools:
 - sandbox_read_file: Read file contents from the sandbox
 - sandbox_enable_network: Enable persistent internet access
 - sandbox_disable_network: Disable internet access
+- sandbox_stop: Stop and remove the sandbox container for the current session
 - sandbox_filesystem_info: Explain the sandbox filesystem layout and mounts
 
 Git tools (use 'onit-sandbox setup' for GitHub authentication):
@@ -59,6 +60,7 @@ from mcp.server.fastmcp import Context
 from pydantic import Field
 
 from onit_sandbox.server import (
+    CONTAINER_LABEL,
     DEFAULT_CPU_QUOTA,
     DEFAULT_DATA_MOUNTS,
     DEFAULT_GPU_DEVICES,
@@ -70,6 +72,8 @@ from onit_sandbox.server import (
     FALLBACK_IMAGE,
     INSTALL_TIMEOUT,
     MAX_OUTPUT_BYTES,
+    REAPER_IDLE_TIMEOUT,
+    REAPER_INTERVAL,
     SANDBOX_IMAGE,
     SandboxMCPServer,
     parse_data_mounts,
@@ -90,6 +94,7 @@ class ContainerInfo:
     status: str = "created"
     network_enabled: bool = False
     installed_packages: list = field(default_factory=list)
+    last_activity: float = field(default_factory=time.monotonic)
 
 
 class DockerNotAvailableError(Exception):
@@ -275,6 +280,12 @@ class SandboxManager:
             "--detach",
             "--name",
             container_name,
+            "--label",
+            f"{CONTAINER_LABEL}=true",
+            "--label",
+            f"{CONTAINER_LABEL}.session_id={session_id}",
+            "--label",
+            f"{CONTAINER_LABEL}.created_at={datetime.now().isoformat()}",
             "--volume",
             f"{os.path.abspath(data_path)}:/home/sandbox:rw",
             "--volume",
@@ -337,7 +348,7 @@ class SandboxManager:
         if DEFAULT_CPU_QUOTA > 0:
             cmd.extend(["--cpu-quota", str(DEFAULT_CPU_QUOTA)])
 
-        # Add extra data volume mounts (e.g. /data:/data:ro)
+        # Add extra data volume mounts (e.g. /data:/data:rw)
         for mount in extra_mounts or []:
             cmd.extend(
                 [
@@ -377,6 +388,9 @@ class SandboxManager:
 
             # Add passwd entry for the host UID so pwd.getpwuid() works
             self._ensure_passwd_entry(container_id)
+
+            # Always configure git identity and safe directory
+            self._configure_git_defaults(container_id)
 
             # Configure git credential helper if GitHub token is available
             if github_token:
@@ -423,6 +437,27 @@ class SandboxManager:
             capture_output=True,
             timeout=10,
         )
+
+    def _configure_git_defaults(self, container_id: str) -> None:
+        """Set git identity and safe directory so commits and operations work out-of-the-box."""
+        setup_script = (
+            "git config --global user.name 'Sandbox User' && "
+            "git config --global user.email 'sandbox@onit.local' && "
+            "git config --global --add safe.directory '*' && "
+            "git config --global init.defaultBranch main"
+        )
+        result = subprocess.run(
+            ["docker", "exec", container_id, "sh", "-c", setup_script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Failed to configure git defaults in container %s: %s",
+                container_id,
+                result.stderr,
+            )
 
     def _configure_git_credentials(self, container_id: str) -> None:
         """Configure git inside the container to use the GitHub token.
@@ -480,6 +515,7 @@ class SandboxManager:
             if session_id in self._containers:
                 info = self._containers[session_id]
                 if self._is_container_running(info.container_id):
+                    info.last_activity = time.monotonic()
                     self._ensure_passwd_entry(info.container_id)
                     return info
                 else:
@@ -746,6 +782,92 @@ class SandboxManager:
         for session_id in session_ids:
             self.stop_container(session_id)
 
+    def touch_activity(self, session_id: str) -> None:
+        """Update the last-activity timestamp for a session."""
+        with self._lock:
+            if session_id in self._containers:
+                self._containers[session_id].last_activity = time.monotonic()
+
+    def reap_idle_containers(self, idle_timeout: int = REAPER_IDLE_TIMEOUT) -> list[str]:
+        """Stop containers that have been idle longer than *idle_timeout* seconds.
+
+        Returns the list of session IDs that were reaped.
+        """
+        now = time.monotonic()
+        with self._lock:
+            candidates = [
+                (sid, info)
+                for sid, info in self._containers.items()
+                if (now - info.last_activity) > idle_timeout
+            ]
+
+        reaped: list[str] = []
+        for sid, info in candidates:
+            idle_secs = int(now - info.last_activity)
+            logger.info(
+                "Reaping idle container for session %s (idle %ds > %ds)",
+                sid,
+                idle_secs,
+                idle_timeout,
+            )
+            if self.stop_container(sid):
+                reaped.append(sid)
+        return reaped
+
+    def recover_orphans(self) -> int:
+        """Discover and stop onit-sandbox containers from prior server runs.
+
+        Queries Docker for containers with the ``onit.sandbox`` label that are
+        *not* tracked in ``self._containers``.  These are orphans left behind
+        by a crashed or killed server process.
+
+        Returns the number of orphaned containers stopped.
+        """
+        if not self._check_docker():
+            return 0
+
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "ps",
+                    "-q",
+                    "--filter",
+                    f"label={CONTAINER_LABEL}=true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return 0
+
+            container_ids = [cid.strip() for cid in result.stdout.strip().split("\n") if cid.strip()]
+            if not container_ids:
+                return 0
+
+            # Build set of container IDs we already track
+            with self._lock:
+                tracked_ids = {info.container_id for info in self._containers.values()}
+
+            orphan_ids = [cid for cid in container_ids if cid not in tracked_ids]
+            stopped = 0
+            for cid in orphan_ids:
+                try:
+                    logger.info("Stopping orphaned container %s", cid[:12])
+                    subprocess.run(
+                        ["docker", "stop", cid],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    stopped += 1
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    logger.warning("Failed to stop orphaned container %s", cid[:12])
+            return stopped
+
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return 0
+
     def get_container_stats(self, container_id: str) -> dict[str, Any] | None:
         """Get resource usage stats for a container."""
         try:
@@ -774,6 +896,58 @@ class SandboxManager:
         return []
 
 
+class ContainerReaper:
+    """Background thread that periodically stops idle sandbox containers.
+
+    The reaper runs every *interval* seconds and asks the
+    :class:`SandboxManager` to stop any container whose ``last_activity``
+    timestamp is older than *idle_timeout* seconds.
+    """
+
+    def __init__(
+        self,
+        manager: SandboxManager,
+        idle_timeout: int = REAPER_IDLE_TIMEOUT,
+        interval: int = REAPER_INTERVAL,
+    ) -> None:
+        self._manager = manager
+        self._idle_timeout = idle_timeout
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Start the reaper background thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="container-reaper")
+        self._thread.start()
+        logger.info(
+            "Container reaper started (idle_timeout=%ds, interval=%ds)",
+            self._idle_timeout,
+            self._interval,
+        )
+
+    def stop(self) -> None:
+        """Signal the reaper thread to stop and wait for it."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def _run(self) -> None:
+        """Reaper loop — runs in a daemon thread."""
+        while not self._stop_event.is_set():
+            try:
+                reaped = self._manager.reap_idle_containers(self._idle_timeout)
+                if reaped:
+                    logger.info("Reaper cleaned up %d idle container(s): %s", len(reaped), reaped)
+            except Exception:
+                logger.exception("Container reaper encountered an error")
+            self._stop_event.wait(self._interval)
+
+
 # ---------------------------------------------------------------------------
 # Module globals — set by run() at startup or by the parent ToolsMCPServer
 # ---------------------------------------------------------------------------
@@ -783,6 +957,7 @@ SESSION_ID: str | None = None
 DATA_MOUNTS: list[dict[str, str]] = parse_data_mounts(DEFAULT_DATA_MOUNTS)
 
 _manager = SandboxManager()
+_reaper = ContainerReaper(_manager)
 _server = SandboxMCPServer()
 mcp = _server.mcp
 
@@ -2306,7 +2481,20 @@ async def sandbox_git_commit(
         # Use heredoc to safely pass the commit message
         all_flag = " -a" if all else ""
         cmd = f"{cd}git commit{all_flag} -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
-        return _run_git_command(cmd, session_id=session_id)
+        result = _run_git_command(cmd, session_id=session_id)
+
+        # Auto-recover: if nothing was staged and all=False, retry with -a
+        parsed = json.loads(result)
+        if (
+            parsed.get("status") == "error"
+            and not all
+            and "nothing to commit" not in parsed.get("output", "")
+            and "no changes added to commit" in parsed.get("output", "")
+        ):
+            cmd = f"{cd}git commit -a -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
+            result = _run_git_command(cmd, session_id=session_id)
+
+        return result
 
     return await _run_with_progress(ctx, _impl)
 
@@ -2388,8 +2576,22 @@ async def sandbox_git_push(
             network=True,
             timeout=120,
         )
-        # Parse the result to add clarity about what happened
+        # Auto-retry with --set-upstream when the branch has no upstream
         parsed = json.loads(result)
+        if (
+            parsed.get("status") == "error"
+            and "has no upstream branch" in parsed.get("output", "")
+            and not set_upstream
+        ):
+            result = _run_git_command(
+                f"{cd}git push --porcelain -u {remote}{branch_arg} 2>&1",
+                session_id=session_id,
+                network=True,
+                timeout=120,
+            )
+            parsed = json.loads(result)
+
+        # Parse the result to add clarity about what happened
         if parsed.get("status") == "ok":
             output = parsed.get("output", "")
             if "rejected" in output:
@@ -2743,6 +2945,43 @@ async def sandbox_git_auth_status(
 
 
 @mcp.tool(
+    title="Stop Sandbox",
+    description="""Stop and remove the sandbox container for the current session.
+
+Call this when you are completely done with the sandbox and want to release its
+resources.  The container (and any data not persisted to the shared volume) will
+be destroyed.  A new container will be created automatically if any sandbox tool
+is called again for the same session.""",
+)
+async def sandbox_stop(
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    sid = _get_session_id(session_id)
+
+    with _manager._lock:
+        info = _manager._containers.get(sid)
+
+    if info is None:
+        return json.dumps(
+            {"status": "ok", "message": f"No active container for session {sid}."},
+            indent=2,
+        )
+
+    stopped = _manager.stop_container(sid)
+    if stopped:
+        logger.info("Agent requested stop for session %s", sid)
+        return json.dumps(
+            {"status": "ok", "message": f"Container for session {sid} stopped and removed."},
+            indent=2,
+        )
+    return json.dumps(
+        {"status": "error", "error": f"Failed to stop container for session {sid}."},
+        indent=2,
+    )
+
+
+@mcp.tool(
     title="Sandbox Filesystem Info",
     description="""Explains the filesystem layout inside the sandbox container.
 Returns a description of key directories, their purpose, and current mount configuration.
@@ -2771,9 +3010,9 @@ async def sandbox_filesystem_info(
   .cache/huggingface  HuggingFace cache (models, datasets, tokenizers).
   .local/bin        User-installed executables (on PATH).
 
-/data               Optional data directory. Typically mounted read-only for
-                    datasets, CSVs, or other input files the agent should
-                    read but not modify.
+/data               Optional data directory. Mounted read-write by default
+                    for datasets, pre-processed caches, CSVs, or other files
+                    the agent may read and write.
 
 /tmp                Temporary files. Cleared on container restart.
 
@@ -2845,16 +3084,25 @@ def run(
     _server.path = path
     _server.transport = transport
 
+    # Recover orphaned containers from prior server runs before accepting traffic.
+    orphans = _manager.recover_orphans()
+    if orphans:
+        logger.info("Recovered and stopped %d orphaned container(s) from a previous run", orphans)
+
     # Register cleanup handlers so containers are stopped on exit (including Ctrl+C)
     atexit.register(cleanup_all_sandboxes)
 
     def _shutdown_handler(signum: int, frame: Any) -> None:
         logger.info("Received signal %s, cleaning up containers...", signum)
+        _reaper.stop()
         cleanup_all_sandboxes()
         raise SystemExit(0)
 
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
+
+    # Start the background container reaper.
+    _reaper.start()
 
     logger.info(
         "Starting Sandbox MCP Server on http://%s:%s%s (transport: %s)",
@@ -2873,4 +3121,5 @@ def cleanup_sandbox(session_id: str) -> bool:
 
 def cleanup_all_sandboxes() -> None:
     """Cleanup all sandbox containers. Call during application shutdown."""
+    _reaper.stop()
     _manager.cleanup_all()

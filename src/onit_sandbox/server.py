@@ -33,6 +33,14 @@ MAX_TIMEOUT = int(os.getenv("SANDBOX_MAX_TIMEOUT", "604800"))  # 7 days
 INSTALL_TIMEOUT = int(os.getenv("SANDBOX_INSTALL_TIMEOUT", "1800"))
 DEFAULT_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "32g")
 
+# Container reaper settings.
+# Idle timeout: seconds with no tool activity before a container is reaped.
+REAPER_IDLE_TIMEOUT = int(os.getenv("SANDBOX_REAPER_IDLE_TIMEOUT", "1800"))  # 30 min
+# How often the reaper thread checks for idle containers (seconds).
+REAPER_INTERVAL = int(os.getenv("SANDBOX_REAPER_INTERVAL", "60"))
+# Docker label used to identify onit-sandbox containers for orphan recovery.
+CONTAINER_LABEL = "onit.sandbox"
+
 # GPU device selection.
 # Specify which GPU device(s) to expose to containers.
 # Examples: "0", "1", "2", "0,1", "all" (default).
@@ -44,8 +52,8 @@ DEFAULT_GPU_DEVICES = os.getenv(
 
 # Data mount configuration.
 # Comma-separated list of "host_path:container_path[:mode]" entries.
-# mode is "ro" (read-only, default) or "rw" (read-write).
-# Example: SANDBOX_DATA_MOUNTS="/data:/data:ro,/checkpoints:/checkpoints:rw"
+# mode is "rw" (read-write, default) or "ro" (read-only).
+# Example: SANDBOX_DATA_MOUNTS="/data:/data,/checkpoints:/checkpoints:ro"
 DEFAULT_DATA_MOUNTS = os.getenv("SANDBOX_DATA_MOUNTS", "")
 
 # Maximum bytes of stdout/stderr returned per tool call.
@@ -72,10 +80,10 @@ def parse_data_mounts(raw: str | list[str]) -> list[dict[str, str]]:
             continue
         host_path = parts[0]
         container_path = parts[1]
-        mode = parts[2] if len(parts) >= 3 else "ro"
+        mode = parts[2] if len(parts) >= 3 else "rw"
         if mode not in ("ro", "rw"):
-            logger.warning("Invalid mount mode '%s' in '%s', defaulting to ro", mode, entry)
-            mode = "ro"
+            logger.warning("Invalid mount mode '%s' in '%s', defaulting to rw", mode, entry)
+            mode = "rw"
         if not os.path.exists(host_path):
             logger.warning("Mount host path does not exist: %s — will attempt to create", host_path)
             try:

@@ -169,8 +169,8 @@ onit-sandbox start
 # Start in foreground (useful for debugging)
 onit-sandbox start --foreground
 
-# Start with data volume mounts
-onit-sandbox start --mount /data:/data:ro --mount /checkpoints:/checkpoints:rw
+# Start with data volume mounts (read-write by default)
+onit-sandbox start --mount /data:/data --mount /checkpoints:/checkpoints
 
 # Start with a specific GPU (e.g. GPU 2)
 onit-sandbox start --gpu 2
@@ -318,6 +318,11 @@ Toggle persistent internet access. Use `enable_network` before downloading datas
 ### Git Tools
 
 All git tools operate inside the sandbox container. For private repos, run `onit-sandbox setup` first to configure authentication. Network is automatically enabled for operations that need it (clone, pull, push).
+
+**Auto-recovery:** Git tools automatically handle common first-use issues so agents don't waste tool calls on predictable failures:
+- **Identity** — `user.name`, `user.email`, and `init.defaultBranch main` are pre-configured in every container.
+- **Push upstream** — if `git push` fails because the branch has no upstream, it automatically retries with `-u`.
+- **Unstaged changes** — if `git commit` fails because changes exist but aren't staged, it automatically retries with `-a`.
 
 #### `sandbox_git_clone`
 
@@ -495,22 +500,22 @@ Mount host directories into the sandbox for direct access to datasets, model wei
 ### Via CLI
 
 ```bash
-# Read-only data, read-write checkpoints
+# Read-write data (default), read-only reference datasets
 onit-sandbox start \
-  --mount /data/datasets:/data:ro \
-  --mount /data/checkpoints:/checkpoints:rw
+  --mount /data/datasets:/data \
+  --mount /data/reference:/reference:ro
 
 # Multiple mounts
 onit-sandbox start \
   --mount /nas/imagenet:/data/imagenet:ro \
-  --mount /scratch/outputs:/outputs:rw
+  --mount /scratch/outputs:/outputs
 ```
 
 ### Via Environment Variable
 
 ```bash
-# Comma-separated "host:container:mode" entries
-export SANDBOX_DATA_MOUNTS="/data:/data:ro,/checkpoints:/checkpoints:rw"
+# Comma-separated "host:container[:mode]" entries (mode defaults to rw)
+export SANDBOX_DATA_MOUNTS="/data:/data,/checkpoints:/checkpoints,/reference:/reference:ro"
 onit-sandbox start
 ```
 
@@ -518,16 +523,16 @@ onit-sandbox start
 
 | Mode | Description |
 |------|-------------|
-| `ro` | Read-only (default) — sandbox can read but not modify host data |
-| `rw` | Read-write — sandbox can read and write to the host directory |
+| `rw` | Read-write (default) — sandbox can read and write to the host directory |
+| `ro` | Read-only — sandbox can read but not modify host data |
 
 ### Example: Training Pipeline
 
 ```bash
-# Start sandbox with dataset and output mounts
+# Start sandbox with dataset and output mounts (both read-write by default)
 onit-sandbox start \
-  --mount /data/imagenet:/data:ro \
-  --mount /results:/results:rw
+  --mount /data/imagenet:/data \
+  --mount /results:/results
 ```
 
 The AI agent can then:
@@ -535,8 +540,9 @@ The AI agent can then:
 1. List available data: `sandbox_list_files(path="/data")`
 2. Write training code: `sandbox_write_file(file_path="train.py", content="...")`
 3. Run training: `sandbox_run_code(command="python train.py", timeout=3600)`
-4. Monitor progress: `sandbox_read_file(file_path="train.log")`
-5. Results are written directly to `/results` on the host via the `rw` mount
+4. Cache pre-processed datasets: results saved directly to `/data` for reuse across sessions
+5. Monitor progress: `sandbox_read_file(file_path="train.log")`
+6. Results are written directly to `/results` on the host
 
 ## Configuration
 
@@ -553,7 +559,7 @@ onit-sandbox start [OPTIONS]
   --data-path    Host data directory, mounted as /home/sandbox inside the sandbox (default: /tmp/onit/data)
   --mount        Mount host directory into sandbox (repeatable)
                  Format: HOST_PATH:CONTAINER_PATH[:MODE]
-                 MODE is "ro" (default) or "rw"
+                 MODE is "rw" (default) or "ro"
   --gpu          GPU device(s) to expose to containers
                  Examples: "0", "1", "2", "0,1", "all" (default)
                  Overrides CUDA_VISIBLE_DEVICES and SANDBOX_GPU_DEVICES env vars
@@ -582,7 +588,7 @@ onit-sandbox status     Check server status
 | `SANDBOX_MAX_TIMEOUT` | `86400` | Maximum command timeout — 24 hours (seconds) |
 | `SANDBOX_INSTALL_TIMEOUT` | `600` | Package install timeout (seconds) |
 | `SANDBOX_PIP_CACHE_PATH` | `/tmp/onit/pip-cache` | Shared pip cache across sessions |
-| `SANDBOX_DATA_MOUNTS` | *(empty)* | Comma-separated mount specs (e.g. `/data:/data:ro`) |
+| `SANDBOX_DATA_MOUNTS` | *(empty)* | Comma-separated mount specs (e.g. `/data:/data`). Mode defaults to `rw`; use `:ro` for read-only. |
 | `SANDBOX_GPU_DEVICES` | `all` | GPU device(s) to expose (e.g. `0`, `0,1`, `all`). Falls back to `CUDA_VISIBLE_DEVICES` if unset. |
 | `SANDBOX_MAX_OUTPUT_BYTES` | `50000` | Max stdout/stderr bytes per tool call |
 
@@ -607,7 +613,7 @@ docker:
   max_timeout: 86400     # 24 hours
   max_output_bytes: 50000
   data_mounts: []
-  # data_mounts: ["/data:/data:ro", "/checkpoints:/checkpoints:rw"]
+  # data_mounts: ["/data:/data", "/checkpoints:/checkpoints", "/reference:/reference:ro"]
 ```
 
 ## Integration with OnIt
@@ -633,7 +639,7 @@ run(
     host="0.0.0.0",
     port=18205,
     options={
-        "data_mounts": ["/data:/data:ro", "/checkpoints:/checkpoints:rw"],
+        "data_mounts": ["/data:/data", "/checkpoints:/checkpoints"],
     },
 )
 
@@ -653,7 +659,7 @@ cleanup_sandbox(session_id="my-session")
 | Network | Disabled by default — enabled only during `install_packages`, git clone/push/pull, or on request |
 | Lifecycle | Containers auto-removed on stop (`--rm` flag) |
 | GPU | Optional NVIDIA GPU passthrough when available |
-| Data mounts | Default to read-only; read-write must be explicitly requested |
+| Data mounts | Default to read-write for caching pre-processed data; use `:ro` to restrict |
 | Credentials | GitHub tokens stored in OS keychain (with `keyring`) or file with `0o600` permissions; injected via env var, never written to disk inside containers |
 
 ### What's Blocked
@@ -667,7 +673,7 @@ cleanup_sandbox(session_id="my-session")
 
 - Full PyPI access during `install_packages` or with network enabled
 - Read/write to home directory
-- Read access to data mounts (write if `rw` mode)
+- Read/write access to data mounts (default); read-only if mounted with `:ro`
 - Python execution with any installed packages
 - Shell commands within resource limits
 
@@ -727,6 +733,8 @@ mypy src/                # Type check
 | DataLoader crashes with shared memory error | Increase shared memory: `SANDBOX_SHM_SIZE=32g` or reduce `num_workers` |
 | OOM during training | Increase memory limit: `SANDBOX_MEMORY_LIMIT=128g`, or use quantization (`bitsandbytes`) / PEFT (`peft`) |
 | Old packages after rebuild | Stop running sessions and restart — containers use the image from when they were created |
+| Git commit fails with "tell me who you are" | This is auto-configured in new containers. If you see it, restart the session to pick up the fix. |
+| Git push fails with "no upstream branch" | Auto-recovered — the tool retries with `-u`. No action needed. |
 | Git clone/push fails with 401 | Run `onit-sandbox setup` to configure a GitHub token |
 | Git push fails with 403 | Token may lack `repo` scope — create a new token with the correct permissions |
 | `onit-sandbox setup status` shows "file" storage | Install `keyring` for OS keychain storage: `pip install keyring` |

@@ -121,7 +121,7 @@ RUN pip install --no-cache-dir \
 # flash-attn requires CUDA at build time; skip gracefully if unavailable
 RUN pip install --no-cache-dir flash-attn --no-build-isolation || true
 
-# Set up data directory
+# Set up data directory (mounted read-write by default for dataset caching)
 RUN mkdir -p /data \
     && chown sandbox:sandbox /data
 

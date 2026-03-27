@@ -9,7 +9,21 @@
       "Bash(python -m onit_sandbox.cli setup --show)",
       "Bash(python -c \"from keyrings.alt.file import EncryptedKeyring; print\\(EncryptedKeyring.priority\\)\")",
       "Bash(nvidia-smi)",
-      "Bash(docker run:*)"
+      "Bash(docker run:*)",
+      "Read(//data/**)",
+      "Bash(wget -c https://www.openslr.org/resources/12/dev-clean.tar.gz)",
+      "Bash(wget -c https://www.openslr.org/resources/12/dev-other.tar.gz)",
+      "Bash(wget -c https://www.openslr.org/resources/12/test-clean.tar.gz)",
+      "Bash(wget -c https://www.openslr.org/resources/12/test-other.tar.gz)",
+      "Bash(wget -c https://www.openslr.org/resources/12/train-clean-100.tar.gz)",
+      "Bash(wget -c https://www.openslr.org/resources/12/train-clean-360.tar.gz)",
+      "Bash(wget -c https://www.openslr.org/resources/12/train-other-500.tar.gz)",
+      "Bash(tar xzf:*)",
+      "Bash(python -c \"from onit_sandbox.mcp_server import _manager, _reaper, ContainerReaper, sandbox_stop; print\\(''Imports OK''\\); print\\(''Reaper type:'', type\\(_reaper\\).__name__\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/onit_sandbox/server.py''\\).read\\(\\)\\); ast.parse\\(open\\(''src/onit_sandbox/mcp_server.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+    ],
+    "additionalDirectories": [
+      "/data"
     ]
   }
 }
