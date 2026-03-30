@@ -5,6 +5,10 @@ Provides start / stop / status / setup subcommands with PID-file management,
 mirroring the pattern used in onit-workspace.
 """
 
+# WARNING: This file has high cyclomatic complexity (CC > 20)
+# This indicates complex conditional logic that may benefit from refactoring.
+# See analyze_complexity.py for details.
+
 from __future__ import annotations
 
 import argparse

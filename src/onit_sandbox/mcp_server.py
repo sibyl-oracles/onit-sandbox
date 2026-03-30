@@ -35,6 +35,10 @@ Git tools (use 'onit-sandbox setup' for GitHub authentication):
 - sandbox_git_stash: Stash or restore uncommitted changes
 """
 
+# WARNING: This file has high cyclomatic complexity (CC > 20)
+# This indicates complex conditional logic that may benefit from refactoring.
+# See analyze_complexity.py for details.
+
 from __future__ import annotations
 
 import asyncio
