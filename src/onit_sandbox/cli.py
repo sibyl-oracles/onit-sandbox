@@ -25,21 +25,28 @@ from onit_sandbox.server import DEFAULT_HOST, DEFAULT_PORT, build_server_url
 
 # State directory — mirrors ~/.onit-workspace/ convention
 STATE_DIR = Path.home() / ".onit-sandbox"
-PID_FILE = STATE_DIR / "server.pid"
-LOG_FILE = STATE_DIR / "server.log"
 GITHUB_TOKEN_FILE = STATE_DIR / "github_token"
 HF_TOKEN_FILE = STATE_DIR / "hf_token"
+
+
+def _pid_file(port: int) -> Path:
+    return STATE_DIR / f"server-{port}.pid"
+
+
+def _log_file(port: int) -> Path:
+    return STATE_DIR / f"server-{port}.log"
 
 
 def _ensure_state_dir() -> None:
     STATE_DIR.mkdir(mode=0o700, exist_ok=True)
 
 
-def _get_pid() -> int | None:
-    """Read stored PID, or None."""
-    if PID_FILE.exists():
+def _get_pid(port: int) -> int | None:
+    """Read stored PID for the given port, or None."""
+    pid_file = _pid_file(port)
+    if pid_file.exists():
         try:
-            return int(PID_FILE.read_text().strip())
+            return int(pid_file.read_text().strip())
         except (ValueError, OSError):
             pass
     return None
@@ -53,14 +60,13 @@ def _is_process_running(pid: int) -> bool:
         return False
 
 
-def _write_pid(pid: int) -> None:
+def _write_pid(pid: int, port: int) -> None:
     _ensure_state_dir()
-    PID_FILE.write_text(str(pid))
+    _pid_file(port).write_text(str(pid))
 
 
-def _remove_pid() -> None:
-    if PID_FILE.exists():
-        PID_FILE.unlink(missing_ok=True)
+def _remove_pid(port: int) -> None:
+    _pid_file(port).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -70,9 +76,9 @@ def _remove_pid() -> None:
 
 def cmd_start(args: argparse.Namespace) -> None:
     """Start the sandbox MCP server."""
-    pid = _get_pid()
+    pid = _get_pid(args.port)
     if pid and _is_process_running(pid):
-        print(f"Server is already running (PID: {pid})")
+        print(f"Server is already running on port {args.port} (PID: {pid})")
         return
 
     if args.foreground:
@@ -95,7 +101,7 @@ def _run_foreground(args: argparse.Namespace) -> None:
     if mounts:
         print(f"Data mounts: {', '.join(mounts)}")
 
-    _write_pid(os.getpid())
+    _write_pid(os.getpid(), args.port)
     try:
         opts: dict[str, Any] = {
             "data_path": getattr(args, "data_path", "/tmp/onit/data"),
@@ -111,7 +117,7 @@ def _run_foreground(args: argparse.Namespace) -> None:
             options=opts,
         )
     finally:
-        _remove_pid()
+        _remove_pid(args.port)
 
 
 def _run_background(args: argparse.Namespace) -> None:
@@ -138,7 +144,7 @@ def _run_background(args: argparse.Namespace) -> None:
     if getattr(args, "gpu", None) is not None:
         cmd.extend(["--gpu", args.gpu])
 
-    log_fh = open(LOG_FILE, "a")
+    log_fh = open(_log_file(args.port), "a")
     process = subprocess.Popen(
         cmd,
         stdout=log_fh,
@@ -149,27 +155,27 @@ def _run_background(args: argparse.Namespace) -> None:
     time.sleep(1)
 
     if process.poll() is None:
-        _write_pid(process.pid)
+        _write_pid(process.pid, args.port)
         url = build_server_url(args.host, args.port, args.transport)
         print(f"Sandbox MCP Server started on {url} (PID: {process.pid})")
-        print(f"Logs: {LOG_FILE}")
+        print(f"Logs: {_log_file(args.port)}")
     else:
-        print("Failed to start server. Check logs at:", LOG_FILE)
+        print("Failed to start server. Check logs at:", _log_file(args.port))
 
 
-def cmd_stop(_args: argparse.Namespace) -> None:
+def cmd_stop(args: argparse.Namespace) -> None:
     """Stop the sandbox MCP server."""
-    pid = _get_pid()
+    pid = _get_pid(args.port)
     if not pid:
-        print("Server is not running (no PID file)")
+        print(f"Server is not running on port {args.port} (no PID file)")
         return
 
     if not _is_process_running(pid):
-        print("Server is not running (stale PID file)")
-        _remove_pid()
+        print(f"Server is not running on port {args.port} (stale PID file)")
+        _remove_pid(args.port)
         return
 
-    print(f"Stopping server (PID: {pid})...")
+    print(f"Stopping server on port {args.port} (PID: {pid})...")
     try:
         os.kill(pid, signal.SIGTERM)
         for _ in range(10):
@@ -183,22 +189,22 @@ def cmd_stop(_args: argparse.Namespace) -> None:
     except OSError as e:
         print(f"Error stopping server: {e}")
     finally:
-        _remove_pid()
+        _remove_pid(args.port)
         # Cleanup all containers
         from onit_sandbox.mcp_server import cleanup_all_sandboxes
 
         cleanup_all_sandboxes()
 
 
-def cmd_status(_args: argparse.Namespace) -> None:
+def cmd_status(args: argparse.Namespace) -> None:
     """Check server status."""
-    pid = _get_pid()
+    pid = _get_pid(args.port)
     if pid and _is_process_running(pid):
-        print(f"Server is running (PID: {pid})")
+        print(f"Server is running on port {args.port} (PID: {pid})")
     else:
-        print("Server is not running")
+        print(f"Server is not running on port {args.port}")
         if pid:
-            _remove_pid()
+            _remove_pid(args.port)
 
 
 # ---------------------------------------------------------------------------
@@ -627,10 +633,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # stop
-    subparsers.add_parser("stop", help="Stop the server")
+    stop_p = subparsers.add_parser("stop", help="Stop the server")
+    stop_p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port of the server to stop")
 
     # status
-    subparsers.add_parser("status", help="Check server status")
+    status_p = subparsers.add_parser("status", help="Check server status")
+    status_p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port of the server to check")
 
     # setup
     setup_p = subparsers.add_parser(
