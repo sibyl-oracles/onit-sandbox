@@ -51,6 +51,7 @@ RUN pip install --no-cache-dir \
     torch \
     torchvision \
     torchaudio \
+    torchcodec \
     --index-url https://download.pytorch.org/whl/cu128
 
 # Install common scientific packages in system Python
@@ -125,6 +126,10 @@ RUN pip install --no-cache-dir flash-attn --no-build-isolation || true
 RUN mkdir -p /data \
     && chown sandbox:sandbox /data
 
+# Set up workspace directory for sandbox code and experiments
+RUN mkdir -p /workspace \
+    && chown sandbox:sandbox /workspace
+
 # Ensure pip cache, HuggingFace cache, and user-install dirs are writable
 RUN mkdir -p /home/sandbox/.cache/pip /home/sandbox/.cache/huggingface /home/sandbox/.local \
     && chown -R sandbox:sandbox /home/sandbox
@@ -145,7 +150,7 @@ ENV TOKENIZERS_PARALLELISM=true
 ENV PYTHONUNBUFFERED=1
 
 # Set working directory
-WORKDIR /home/sandbox
+WORKDIR /workspace
 
 # Default command - keep container running
 CMD ["sleep", "infinity"]
