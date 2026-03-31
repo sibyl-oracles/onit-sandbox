@@ -566,10 +566,7 @@ def _setup_hf_token() -> None:
         return
 
     if not token.startswith("hf_"):
-        print(
-            "Warning: Token doesn't look like a HuggingFace token "
-            "(expected hf_* prefix)."
-        )
+        print("Warning: Token doesn't look like a HuggingFace token " "(expected hf_* prefix).")
         confirm = input("Save anyway? [y/N]: ").strip().lower()
         if confirm not in ("y", "yes"):
             print("Aborting HuggingFace token setup.")
@@ -638,7 +635,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # status
     status_p = subparsers.add_parser("status", help="Check server status")
-    status_p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port of the server to check")
+    status_p.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help="Port of the server to check"
+    )
 
     # setup
     setup_p = subparsers.add_parser(

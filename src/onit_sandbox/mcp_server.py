@@ -866,7 +866,9 @@ class SandboxManager:
             if result.returncode != 0:
                 return 0
 
-            container_ids = [cid.strip() for cid in result.stdout.strip().split("\n") if cid.strip()]
+            container_ids = [
+                cid.strip() for cid in result.stdout.strip().split("\n") if cid.strip()
+            ]
             if not container_ids:
                 return 0
 
@@ -1223,12 +1225,10 @@ async def sandbox_run_code(
                 f"> /dev/null 2>&1 &"
             )
 
-            exit_code, _, stderr = _manager.exec_in_container(
-                container_info.container_id, wrapper
-            )
+            exit_code, output = _manager.exec_in_container(container_info.container_id, wrapper)
             if exit_code != 0:
                 return json.dumps(
-                    {"status": "error", "error": f"Failed to launch background job: {stderr}"},
+                    {"status": "error", "error": f"Failed to launch background job: {output}"},
                     indent=2,
                 )
 
@@ -1242,9 +1242,7 @@ async def sandbox_run_code(
                 indent=2,
             )
         except DockerNotAvailableError:
-            return json.dumps(
-                {"status": "error", "error": "Docker is not available."}, indent=2
-            )
+            return json.dumps({"status": "error", "error": "Docker is not available."}, indent=2)
         except Exception as e:
             logger.exception("Error launching background job")
             return json.dumps({"status": "error", "error": str(e)}, indent=2)
@@ -1400,7 +1398,7 @@ async def sandbox_check_job(
             job_dir = f"/workspace/.jobs/{job_id}"
 
             # Read job status
-            exit_code, status_out, _ = _manager.exec_in_container(
+            exit_code, status_out = _manager.exec_in_container(
                 container_info.container_id,
                 f"cat {job_dir}/status 2>/dev/null || echo 'not_found'",
             )
@@ -1415,7 +1413,7 @@ async def sandbox_check_job(
             # Read exit code if job is done
             returncode = None
             if job_status == "done":
-                _, ec_out, _ = _manager.exec_in_container(
+                _, ec_out = _manager.exec_in_container(
                     container_info.container_id,
                     f"cat {job_dir}/exitcode 2>/dev/null",
                 )
@@ -1426,11 +1424,11 @@ async def sandbox_check_job(
 
             # Read stdout and stderr (tail N lines)
             tail_cmd = f"tail -n {tail}" if tail > 0 else "cat"
-            _, stdout, _ = _manager.exec_in_container(
+            _, stdout = _manager.exec_in_container(
                 container_info.container_id,
                 f"{tail_cmd} {job_dir}/stdout.log 2>/dev/null",
             )
-            _, stderr, _ = _manager.exec_in_container(
+            _, stderr = _manager.exec_in_container(
                 container_info.container_id,
                 f"{tail_cmd} {job_dir}/stderr.log 2>/dev/null",
             )
@@ -1450,9 +1448,7 @@ async def sandbox_check_job(
             return json.dumps(result, indent=2)
 
         except DockerNotAvailableError:
-            return json.dumps(
-                {"status": "error", "error": "Docker is not available."}, indent=2
-            )
+            return json.dumps({"status": "error", "error": "Docker is not available."}, indent=2)
         except Exception as e:
             logger.exception("Error in sandbox_check_job")
             return json.dumps({"status": "error", "error": str(e)}, indent=2)
@@ -3112,9 +3108,11 @@ async def sandbox_git_auth_status(
                     "session_id": sid,
                     "auth_configured": auth_ready,
                     "details": output.strip(),
-                    "hint": None
-                    if auth_ready
-                    else "GitHub token not configured. Run 'onit-sandbox setup' on the host to store a GitHub Personal Access Token.",
+                    "hint": (
+                        None
+                        if auth_ready
+                        else "GitHub token not configured. Run 'onit-sandbox setup' on the host to store a GitHub Personal Access Token."
+                    ),
                 },
                 indent=2,
             )
@@ -3176,9 +3174,7 @@ async def sandbox_filesystem_info(
 ) -> str:
     mounts_info = []
     for m in DATA_MOUNTS:
-        mounts_info.append(
-            f"  {m['container']}  (mounted from host, mode: {m['mode']})"
-        )
+        mounts_info.append(f"  {m['container']}  (mounted from host, mode: {m['mode']})")
 
     mounts_section = "\n".join(mounts_info) if mounts_info else "  (none configured)"
 
