@@ -7,7 +7,8 @@ container with resource limits, network isolation, and a shared home directory.
 
 Tools:
 - sandbox_install_packages: Install Python packages in the sandbox
-- sandbox_run_code: Execute commands in the isolated sandbox
+- sandbox_run_code: Execute commands in the isolated sandbox (supports background mode)
+- sandbox_check_job: Check status/output of background jobs
 - sandbox_get_status: Inspect sandbox state, packages, and resource usage
 - sandbox_write_file: Write files into the sandbox
 - sandbox_list_files: List files in the sandbox filesystem
@@ -1163,7 +1164,10 @@ No internet by default. Output is streamed in real time.
 
 - command: Shell command to run (e.g. "python train.py --data-dir /data").
 - network: Temporarily enable internet for this command (default false).
-- timeout: Max seconds before the command is killed (default: no limit).""",
+- timeout: Max seconds before the command is killed (default: no limit).
+- background: Run the command in the background and return immediately with a job_id.
+  Use sandbox_check_job to poll status and retrieve output. Ideal for long-running
+  tasks like model training that would otherwise time out.""",
 )
 async def sandbox_run_code(
     command: Annotated[
@@ -1176,11 +1180,76 @@ async def sandbox_run_code(
         int | None,
         Field(description="Max seconds before the command is killed (default: no limit)."),
     ] = None,
+    background: Annotated[
+        bool,
+        Field(
+            description="Run in background and return a job_id immediately. "
+            "Use sandbox_check_job to poll status and retrieve output."
+        ),
+    ] = False,
     session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
     ctx: Context | None = None,
 ) -> str:
     if not command:
         return json.dumps({"status": "error", "error": "No command specified"}, indent=2)
+
+    # --- Background mode: launch command detached and return immediately ---
+    if background:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
+        try:
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
+
+            # Enable network if requested (persistent for background jobs)
+            if network and not container_info.network_enabled:
+                _manager.enable_network(container_info.container_id)
+
+            job_id = uuid.uuid4().hex[:12]
+            jobs_dir = "/workspace/.jobs"
+            job_dir = f"{jobs_dir}/{job_id}"
+
+            # Create job directory and launch the command via nohup with output capture.
+            # A wrapper script writes the PID, captures exit code, and marks completion.
+            wrapper = (
+                f"mkdir -p {job_dir} && "
+                f"echo 'running' > {job_dir}/status && "
+                f"echo {json.dumps(command)} > {job_dir}/command && "
+                f"nohup sh -c "
+                f"'({command}) > {job_dir}/stdout.log 2> {job_dir}/stderr.log; "
+                f"echo $? > {job_dir}/exitcode; "
+                f"echo done > {job_dir}/status' "
+                f"> /dev/null 2>&1 &"
+            )
+
+            exit_code, _, stderr = _manager.exec_in_container(
+                container_info.container_id, wrapper
+            )
+            if exit_code != 0:
+                return json.dumps(
+                    {"status": "error", "error": f"Failed to launch background job: {stderr}"},
+                    indent=2,
+                )
+
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "job_id": job_id,
+                    "session_id": sid,
+                    "message": f"Background job started. Use sandbox_check_job(job_id='{job_id}') to check status and retrieve output.",
+                },
+                indent=2,
+            )
+        except DockerNotAvailableError:
+            return json.dumps(
+                {"status": "error", "error": "Docker is not available."}, indent=2
+            )
+        except Exception as e:
+            logger.exception("Error launching background job")
+            return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+    # --- Foreground mode: stream output in real time ---
 
     # Queue for streaming output lines from the worker thread to the async loop.
     line_queue: queue.Queue[str | None] = queue.Queue()
@@ -1299,6 +1368,96 @@ async def sandbox_run_code(
 
         heartbeat += 1
         await ctx.report_progress(progress=heartbeat, total=heartbeat + 1)
+
+
+@mcp.tool(
+    title="Check Background Job",
+    description="""Check the status of a background job launched with sandbox_run_code(background=True).
+
+- job_id: The job ID returned by sandbox_run_code.
+- tail: Number of lines to return from the end of stdout/stderr (default 100). Use 0 for all output.""",
+)
+async def sandbox_check_job(
+    job_id: Annotated[
+        str | None, Field(description="The job_id returned by sandbox_run_code.")
+    ] = None,
+    tail: Annotated[
+        int, Field(description="Number of lines from end of stdout/stderr (default 100, 0=all).")
+    ] = 100,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    if not job_id:
+        return json.dumps({"status": "error", "error": "No job_id specified"}, indent=2)
+
+    def _impl() -> str:
+        sid = _get_session_id(session_id)
+        data_path = _get_data_path(sid)
+        try:
+            container_info = _manager.get_or_create_container(
+                sid, data_path, extra_mounts=DATA_MOUNTS
+            )
+            job_dir = f"/workspace/.jobs/{job_id}"
+
+            # Read job status
+            exit_code, status_out, _ = _manager.exec_in_container(
+                container_info.container_id,
+                f"cat {job_dir}/status 2>/dev/null || echo 'not_found'",
+            )
+            job_status = status_out.strip()
+
+            if job_status == "not_found":
+                return json.dumps(
+                    {"status": "error", "error": f"Job '{job_id}' not found."},
+                    indent=2,
+                )
+
+            # Read exit code if job is done
+            returncode = None
+            if job_status == "done":
+                _, ec_out, _ = _manager.exec_in_container(
+                    container_info.container_id,
+                    f"cat {job_dir}/exitcode 2>/dev/null",
+                )
+                try:
+                    returncode = int(ec_out.strip())
+                except ValueError:
+                    returncode = -1
+
+            # Read stdout and stderr (tail N lines)
+            tail_cmd = f"tail -n {tail}" if tail > 0 else "cat"
+            _, stdout, _ = _manager.exec_in_container(
+                container_info.container_id,
+                f"{tail_cmd} {job_dir}/stdout.log 2>/dev/null",
+            )
+            _, stderr, _ = _manager.exec_in_container(
+                container_info.container_id,
+                f"{tail_cmd} {job_dir}/stderr.log 2>/dev/null",
+            )
+
+            result: dict[str, Any] = {
+                "status": "ok",
+                "job_id": job_id,
+                "job_status": "running" if job_status == "running" else "completed",
+                "session_id": sid,
+                "stdout": stdout[-MAX_OUTPUT_BYTES:],
+                "stderr": stderr[-MAX_OUTPUT_BYTES:],
+            }
+            if returncode is not None:
+                result["returncode"] = returncode
+                result["job_status"] = "completed"
+
+            return json.dumps(result, indent=2)
+
+        except DockerNotAvailableError:
+            return json.dumps(
+                {"status": "error", "error": "Docker is not available."}, indent=2
+            )
+        except Exception as e:
+            logger.exception("Error in sandbox_check_job")
+            return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+    return await _run_with_progress(ctx, _impl)
 
 
 @mcp.tool(
@@ -3042,7 +3201,7 @@ async def sandbox_filesystem_info(
 
 --- Environment ---
 USER:               sandbox (uid 1000)
-HOME:               /workspace
+HOME:               /home/sandbox
 HF_HOME:            /home/sandbox/.cache/huggingface
 PATH includes:      /home/sandbox/.local/bin
 
@@ -3055,6 +3214,8 @@ PATH includes:      /home/sandbox/.local/bin
 - Network is disabled by default; use sandbox_enable_network or the
   network=true flag on sandbox_run_code to access the internet.
 - Use sandbox_list_files to explore directory contents.
+- For long-running tasks (training, etc.), use sandbox_run_code with
+  background=True to avoid timeouts. Check with sandbox_check_job.
 """
     return json.dumps({"status": "ok", "filesystem_info": info}, indent=2)
 
