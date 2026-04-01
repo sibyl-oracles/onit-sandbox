@@ -34,6 +34,7 @@ Git tools (use 'onit-sandbox setup' for GitHub authentication):
 - sandbox_git_init: Initialize a new repository
 - sandbox_git_remote: Manage remote repositories
 - sandbox_git_stash: Stash or restore uncommitted changes
+- sandbox_github_create_repo: Create a new remote GitHub repository
 """
 
 # WARNING: This file has high cyclomatic complexity (CC > 20)
@@ -47,6 +48,7 @@ import atexit
 import base64
 import functools
 import json
+import re
 import logging
 import os
 import queue
@@ -77,8 +79,6 @@ from onit_sandbox.server import (
     FALLBACK_IMAGE,
     INSTALL_TIMEOUT,
     MAX_OUTPUT_BYTES,
-    REAPER_IDLE_TIMEOUT,
-    REAPER_INTERVAL,
     SANDBOX_IMAGE,
     SandboxMCPServer,
     parse_data_mounts,
@@ -99,7 +99,6 @@ class ContainerInfo:
     status: str = "created"
     network_enabled: bool = False
     installed_packages: list = field(default_factory=list)
-    last_activity: float = field(default_factory=time.monotonic)
 
 
 class DockerNotAvailableError(Exception):
@@ -494,7 +493,8 @@ class SandboxManager:
             "SCRIPT\n"
             "chmod +x /home/sandbox/.local/bin/git-credential-github-token && "
             "git config --global credential.helper github-token && "
-            "git config --global --add safe.directory '*'"
+            "git config --global --add safe.directory '*' && "
+            "git config --global 'url.https://github.com/.insteadOf' 'git@github.com:'"
         )
         result = subprocess.run(
             ["docker", "exec", container_id, "sh", "-c", setup_script],
@@ -520,7 +520,6 @@ class SandboxManager:
             if session_id in self._containers:
                 info = self._containers[session_id]
                 if self._is_container_running(info.container_id):
-                    info.last_activity = time.monotonic()
                     self._ensure_passwd_entry(info.container_id)
                     return info
                 else:
@@ -625,9 +624,7 @@ class SandboxManager:
         Returns (returncode, stdout, stderr) like the split_output variant.
 
         If *activity_callback* is provided it is called every *activity_interval*
-        seconds while the command is running, regardless of output.  Use this to
-        keep the container's idle timer alive during long-running jobs (e.g. model
-        training) so the container reaper does not kill the container.
+        seconds while the command is running, regardless of output.
 
         Environment is extended with PYTHONUNBUFFERED=1 and TERM=dumb so that
         Python flushes immediately and tqdm falls back to newline-based output
@@ -806,38 +803,6 @@ class SandboxManager:
         for session_id in session_ids:
             self.stop_container(session_id)
 
-    def touch_activity(self, session_id: str) -> None:
-        """Update the last-activity timestamp for a session."""
-        with self._lock:
-            if session_id in self._containers:
-                self._containers[session_id].last_activity = time.monotonic()
-
-    def reap_idle_containers(self, idle_timeout: int = REAPER_IDLE_TIMEOUT) -> list[str]:
-        """Stop containers that have been idle longer than *idle_timeout* seconds.
-
-        Returns the list of session IDs that were reaped.
-        """
-        now = time.monotonic()
-        with self._lock:
-            candidates = [
-                (sid, info)
-                for sid, info in self._containers.items()
-                if (now - info.last_activity) > idle_timeout
-            ]
-
-        reaped: list[str] = []
-        for sid, info in candidates:
-            idle_secs = int(now - info.last_activity)
-            logger.info(
-                "Reaping idle container for session %s (idle %ds > %ds)",
-                sid,
-                idle_secs,
-                idle_timeout,
-            )
-            if self.stop_container(sid):
-                reaped.append(sid)
-        return reaped
-
     def recover_orphans(self) -> int:
         """Discover and stop onit-sandbox containers from prior server runs.
 
@@ -922,58 +887,6 @@ class SandboxManager:
         return []
 
 
-class ContainerReaper:
-    """Background thread that periodically stops idle sandbox containers.
-
-    The reaper runs every *interval* seconds and asks the
-    :class:`SandboxManager` to stop any container whose ``last_activity``
-    timestamp is older than *idle_timeout* seconds.
-    """
-
-    def __init__(
-        self,
-        manager: SandboxManager,
-        idle_timeout: int = REAPER_IDLE_TIMEOUT,
-        interval: int = REAPER_INTERVAL,
-    ) -> None:
-        self._manager = manager
-        self._idle_timeout = idle_timeout
-        self._interval = interval
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        """Start the reaper background thread."""
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="container-reaper")
-        self._thread.start()
-        logger.info(
-            "Container reaper started (idle_timeout=%ds, interval=%ds)",
-            self._idle_timeout,
-            self._interval,
-        )
-
-    def stop(self) -> None:
-        """Signal the reaper thread to stop and wait for it."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
-
-    def _run(self) -> None:
-        """Reaper loop — runs in a daemon thread."""
-        while not self._stop_event.is_set():
-            try:
-                reaped = self._manager.reap_idle_containers(self._idle_timeout)
-                if reaped:
-                    logger.info("Reaper cleaned up %d idle container(s): %s", len(reaped), reaped)
-            except Exception:
-                logger.exception("Container reaper encountered an error")
-            self._stop_event.wait(self._interval)
-
-
 # ---------------------------------------------------------------------------
 # Module globals — set by run() at startup or by the parent ToolsMCPServer
 # ---------------------------------------------------------------------------
@@ -983,9 +896,35 @@ SESSION_ID: str | None = None
 DATA_MOUNTS: list[dict[str, str]] = parse_data_mounts(DEFAULT_DATA_MOUNTS)
 
 _manager = SandboxManager()
-_reaper = ContainerReaper(_manager)
 _server = SandboxMCPServer()
 mcp = _server.mcp
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch: suppress ExceptionGroup on client disconnect (MCP SDK bug)
+#
+# On Python 3.10, anyio's ExceptionGroup inherits from BaseException, not
+# Exception.  The MCP SDK's streamable_http_manager catches Exception but not
+# BaseExceptionGroup, so when a client disconnects and the session's TaskGroup
+# teardown surfaces leftover task errors, the ExceptionGroup escapes and
+# crashes the server.  We patch the lowlevel server's run() to catch it.
+# ---------------------------------------------------------------------------
+import mcp.server.lowlevel.server as _ll_server
+
+_original_server_run = _ll_server.Server.run
+
+
+async def _patched_server_run(self, *args, **kwargs):
+    try:
+        return await _original_server_run(self, *args, **kwargs)
+    except BaseException as exc:
+        if "ExceptionGroup" in type(exc).__name__:
+            logger.info("Client disconnected (suppressed %s)", type(exc).__name__)
+        else:
+            raise
+
+
+_ll_server.Server.run = _patched_server_run
 
 
 def _get_session_id(session_id: str | None = None) -> str:
@@ -1029,6 +968,27 @@ def _list_workspace_files(container_id: str) -> set[str]:
 T = TypeVar("T")
 
 _PROGRESS_HEARTBEAT_INTERVAL = 5.0  # seconds between SSE keep-alive heartbeats
+_CTX_TIMEOUT = 15.0  # seconds to wait for ctx.info / ctx.report_progress before giving up
+
+
+async def _safe_ctx_info(ctx: Context, msg: str) -> None:
+    """Send ctx.info with a timeout so a disconnected client cannot hang the server."""
+    try:
+        await asyncio.wait_for(ctx.info(msg), timeout=_CTX_TIMEOUT)
+    except (asyncio.TimeoutError, Exception) as exc:
+        logger.warning("ctx.info timed out or failed (%s), client may have disconnected", exc)
+
+
+async def _safe_ctx_progress(ctx: Context, progress: float, total: float) -> None:
+    """Send ctx.report_progress with a timeout."""
+    try:
+        await asyncio.wait_for(
+            ctx.report_progress(progress=progress, total=total), timeout=_CTX_TIMEOUT
+        )
+    except (asyncio.TimeoutError, Exception) as exc:
+        logger.warning(
+            "ctx.report_progress timed out or failed (%s), client may have disconnected", exc
+        )
 
 
 async def _run_with_progress(
@@ -1060,10 +1020,10 @@ async def _run_with_progress(
         done, _ = await asyncio.wait({future}, timeout=interval)
         if done:
             # Final "complete" notification.
-            await ctx.report_progress(progress=1, total=1)
+            await _safe_ctx_progress(ctx, progress=1, total=1)
             return future.result()
         heartbeat += 1
-        await ctx.report_progress(progress=heartbeat, total=heartbeat + 1)
+        await _safe_ctx_progress(ctx, progress=heartbeat, total=heartbeat + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1279,7 +1239,6 @@ async def sandbox_run_code(
                     command,
                     timeout=timeout,
                     on_output=_on_output,
-                    activity_callback=lambda: _manager.touch_activity(sid),
                 )
 
                 # Detect new files
@@ -1352,7 +1311,7 @@ async def sandbox_run_code(
             except queue.Empty:
                 break
             if line is not None:
-                await ctx.info(line)
+                await _safe_ctx_info(ctx, line)
 
     heartbeat = 0
     while True:
@@ -1361,11 +1320,11 @@ async def sandbox_run_code(
 
         if done:
             await _drain_queue()
-            await ctx.report_progress(progress=1, total=1)
+            await _safe_ctx_progress(ctx, progress=1, total=1)
             return future.result()
 
         heartbeat += 1
-        await ctx.report_progress(progress=heartbeat, total=heartbeat + 1)
+        await _safe_ctx_progress(ctx, progress=heartbeat, total=heartbeat + 1)
 
 
 @mcp.tool(
@@ -2057,17 +2016,17 @@ async def sandbox_download_file(
             except queue.Empty:
                 break
             if msg is not None:
-                await ctx.info(msg)
+                await _safe_ctx_info(ctx, msg)
 
     heartbeat = 0
     while True:
         done, _ = await asyncio.wait({future}, timeout=0.25)
         await _drain()
         if done:
-            await ctx.report_progress(progress=1, total=1)
+            await _safe_ctx_progress(ctx, progress=1, total=1)
             return future.result()
         heartbeat += 1
-        await ctx.report_progress(progress=heartbeat, total=heartbeat + 1)
+        await _safe_ctx_progress(ctx, progress=heartbeat, total=heartbeat + 1)
 
 
 @mcp.tool(
@@ -2454,6 +2413,22 @@ async def sandbox_read_file(
 # Git MCP Tool definitions
 # ---------------------------------------------------------------------------
 
+# Matches SSH-style git URLs: git@github.com:user/repo.git
+_SSH_URL_RE = re.compile(r"^git@github\.com:(.+)$")
+
+
+def _ssh_to_https(url: str) -> str:
+    """Convert a GitHub SSH URL to HTTPS so the credential helper works.
+
+    ``git@github.com:user/repo.git`` → ``https://github.com/user/repo.git``
+
+    Non-SSH URLs are returned unchanged.
+    """
+    m = _SSH_URL_RE.match(url)
+    if m:
+        return f"https://github.com/{m.group(1)}"
+    return url
+
 
 def _run_git_command(
     command: str,
@@ -2571,12 +2546,13 @@ async def sandbox_git_clone(
     ctx: Context | None = None,
 ) -> str:
     def _impl() -> str:
+        clone_url = _ssh_to_https(url)
         cmd = "git clone"
         if branch:
             cmd += f" --branch {branch}"
         if depth and depth > 0:
             cmd += f" --depth {depth}"
-        cmd += f" {url}"
+        cmd += f" {clone_url}"
         if path:
             cmd += f" {path}"
         return _run_git_command(cmd, session_id=session_id, network=True, timeout=300)
@@ -2662,16 +2638,21 @@ async def sandbox_git_commit(
         cmd = f"{cd}git commit{all_flag} -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
         result = _run_git_command(cmd, session_id=session_id)
 
-        # Auto-recover: if nothing was staged and all=False, retry with -a
+        # Auto-recover: if nothing was staged, add all files and retry.
+        # AI clients frequently call commit without a prior git-add.
+        # - "no changes added to commit" → tracked files modified but unstaged
+        # - "nothing to commit (create/copy …)" → untracked files only (e.g. initial commit)
         parsed = json.loads(result)
-        if (
-            parsed.get("status") == "error"
-            and not all
-            and "nothing to commit" not in parsed.get("output", "")
-            and "no changes added to commit" in parsed.get("output", "")
+        output = parsed.get("output", "")
+        if parsed.get("status") == "error" and (
+            "no changes added to commit" in output
+            or "nothing added to commit" in output
+            or ("nothing to commit" in output and "working tree clean" not in output)
         ):
-            cmd = f"{cd}git commit -a -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
-            result = _run_git_command(cmd, session_id=session_id)
+            add_cmd = f"{cd}git add -A"
+            _run_git_command(add_cmd, session_id=session_id)
+            commit_cmd = f"{cd}git commit -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
+            result = _run_git_command(commit_cmd, session_id=session_id)
 
         return result
 
@@ -2747,6 +2728,22 @@ async def sandbox_git_push(
         cd = f"cd /workspace/{path} && " if path else ""
         upstream_flag = " -u" if set_upstream else ""
         branch_arg = f" {branch}" if branch else ""
+
+        # When -u is requested without an explicit branch, resolve the current
+        # branch name so git knows which ref to push (push.default=simple
+        # won't infer it without a configured upstream).
+        if set_upstream and not branch_arg:
+            detect_result = _run_git_command(
+                f"{cd}git rev-parse --abbrev-ref HEAD",
+                session_id=session_id,
+                timeout=10,
+            )
+            detect_parsed = json.loads(detect_result)
+            if detect_parsed.get("status") == "ok":
+                current_branch = detect_parsed["output"].strip()
+                if current_branch and current_branch != "HEAD":
+                    branch_arg = f" {current_branch}"
+
         # Use --porcelain for machine-readable output and 2>&1 to capture
         # progress/errors from stderr
         result = _run_git_command(
@@ -2755,15 +2752,26 @@ async def sandbox_git_push(
             network=True,
             timeout=120,
         )
-        # Auto-retry with --set-upstream when the branch has no upstream
+        # Auto-retry with --set-upstream when the branch has no upstream.
+        # When no branch is specified, extract the branch name from the error
+        # message so git knows which ref to push (push.default=simple won't
+        # infer it without a configured upstream).
         parsed = json.loads(result)
         if (
             parsed.get("status") == "error"
             and "has no upstream branch" in parsed.get("output", "")
             and not set_upstream
         ):
+            retry_branch_arg = branch_arg
+            if not retry_branch_arg:
+                m = re.search(
+                    r"The current branch (\S+) has no upstream branch",
+                    parsed.get("output", ""),
+                )
+                if m:
+                    retry_branch_arg = f" {m.group(1)}"
             result = _run_git_command(
-                f"{cd}git push --porcelain -u {remote}{branch_arg} 2>&1",
+                f"{cd}git push --porcelain -u {remote}{retry_branch_arg} 2>&1",
                 session_id=session_id,
                 network=True,
                 timeout=120,
@@ -3004,7 +3012,7 @@ async def sandbox_git_remote(
                     {"status": "error", "output": "Both 'name' and 'url' are required for 'add'."},
                     indent=2,
                 )
-            cmd = f"{cd}git remote add {name} {url}"
+            cmd = f"{cd}git remote add {name} {_ssh_to_https(url)}"
         elif action == "remove":
             if not name:
                 return json.dumps(
@@ -3126,6 +3134,117 @@ async def sandbox_git_auth_status(
 
 
 @mcp.tool(
+    title="GitHub Create Repo",
+    description="""Create a new remote GitHub repository using the stored GitHub token.
+
+Requires GitHub authentication to be configured via 'onit-sandbox setup'.
+
+- name: Repository name (required).
+- description: Optional repository description.
+- private: Whether the repo should be private (default: true).
+- org: Optional GitHub organization. If omitted, creates under the authenticated user.""",
+)
+async def sandbox_github_create_repo(
+    name: Annotated[
+        str,
+        Field(description="Repository name (e.g. 'my-project')."),
+    ],
+    description: Annotated[
+        str | None,
+        Field(description="Optional repository description."),
+    ] = None,
+    private: Annotated[
+        bool,
+        Field(description="Whether the repository should be private. Defaults to true."),
+    ] = True,
+    org: Annotated[
+        str | None,
+        Field(
+            description="GitHub organization to create the repo under. "
+            "If omitted, creates under the authenticated user."
+        ),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    import urllib.request
+    import urllib.error
+
+    def _impl() -> str:
+        token = _manager._load_github_token()
+        if not token:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "output": "GitHub token not configured. "
+                    "Run 'onit-sandbox setup' on the host to store a GitHub Personal Access Token.",
+                },
+                indent=2,
+            )
+
+        payload: dict[str, Any] = {
+            "name": name,
+            "private": private,
+        }
+        if description:
+            payload["description"] = description
+
+        if org:
+            api_url = f"https://api.github.com/orgs/{org}/repos"
+        else:
+            api_url = "https://api.github.com/user/repos"
+
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            api_url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = json.loads(resp.read().decode())
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "name": resp_data.get("full_name"),
+                        "url": resp_data.get("html_url"),
+                        "clone_url": resp_data.get("clone_url"),
+                        "ssh_url": resp_data.get("ssh_url"),
+                        "private": resp_data.get("private"),
+                    },
+                    indent=2,
+                )
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else ""
+            try:
+                error_detail = json.loads(error_body).get("message", error_body)
+            except (json.JSONDecodeError, AttributeError):
+                error_detail = error_body
+            return json.dumps(
+                {
+                    "status": "error",
+                    "http_status": e.code,
+                    "output": error_detail,
+                },
+                indent=2,
+            )
+        except urllib.error.URLError as e:
+            return json.dumps(
+                {"status": "error", "output": f"Network error: {e.reason}"},
+                indent=2,
+            )
+
+    return await _run_with_progress(ctx, _impl)
+
+
+@mcp.tool(
     title="Stop Sandbox",
     description="""Stop and remove the sandbox container for the current session.
 
@@ -3149,7 +3268,9 @@ async def sandbox_stop(
             indent=2,
         )
 
-    stopped = _manager.stop_container(sid)
+    # Run stop_container in an executor to avoid blocking the event loop
+    # (docker stop can take up to 30s).
+    stopped = await _run_with_progress(ctx, _manager.stop_container, sid)
     if stopped:
         logger.info("Agent requested stop for session %s", sid)
         return json.dumps(
@@ -3275,15 +3396,11 @@ def run(
 
     def _shutdown_handler(signum: int, frame: Any) -> None:
         logger.info("Received signal %s, cleaning up containers...", signum)
-        _reaper.stop()
         cleanup_all_sandboxes()
         raise SystemExit(0)
 
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
-
-    # Start the background container reaper.
-    _reaper.start()
 
     logger.info(
         "Starting Sandbox MCP Server on http://%s:%s%s (transport: %s)",
@@ -3302,5 +3419,4 @@ def cleanup_sandbox(session_id: str) -> bool:
 
 def cleanup_all_sandboxes() -> None:
     """Cleanup all sandbox containers. Call during application shutdown."""
-    _reaper.stop()
     _manager.cleanup_all()
