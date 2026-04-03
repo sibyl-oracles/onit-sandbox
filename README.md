@@ -227,7 +227,7 @@ Install Python packages inside the sandbox via pip. Network is temporarily enabl
 }
 ```
 
-### `sandbox_run_code`
+### `sandbox_bash`
 
 Execute shell commands inside the sandbox. Output is captured and returned (configurable limit, default 50 KB). Automatically detects newly created files.
 
@@ -487,7 +487,7 @@ Stash or restore uncommitted changes.
 1. sandbox_git_clone(url="https://github.com/user/ml-project.git")
 2. sandbox_git_checkout(target="experiment/new-loss", create=true, path="ml-project")
 3. sandbox_write_file(file_path="ml-project/train.py", content="...")
-4. sandbox_run_code(command="cd ml-project && python train.py")
+4. sandbox_bash(command="cd ml-project && python train.py")
 5. sandbox_git_add(files=".", path="ml-project")
 6. sandbox_git_commit(message="Add new loss function", path="ml-project")
 7. sandbox_git_push(set_upstream=true, path="ml-project")
@@ -539,7 +539,7 @@ The AI agent can then:
 
 1. List available data: `sandbox_list_files(path="/data")`
 2. Write training code: `sandbox_write_file(file_path="train.py", content="...")`
-3. Run training: `sandbox_run_code(command="python train.py", timeout=3600)`
+3. Run training: `sandbox_bash(command="python train.py", timeout=3600)`
 4. Cache pre-processed datasets: results saved directly to `/data` for reuse across sessions
 5. Monitor progress: `sandbox_read_file(file_path="train.log")`
 6. Results are written directly to `/results` on the host

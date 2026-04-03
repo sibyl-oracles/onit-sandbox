@@ -20,7 +20,7 @@ from onit_sandbox.mcp_server import (
     sandbox_enable_network,
     sandbox_get_status,
     sandbox_install_packages,
-    sandbox_run_code,
+    sandbox_bash,
 )
 
 
@@ -84,9 +84,9 @@ class TestSandboxTools:
         data = json.loads(result)
         assert data["status"] == "error"
 
-    def test_sandbox_run_code_no_command(self):
-        """Test sandbox_run_code with no command specified."""
-        result = _run(sandbox_run_code(command=None))
+    def test_sandbox_bash_no_command(self):
+        """Test sandbox_bash with no command specified."""
+        result = _run(sandbox_bash(command=None))
         data = json.loads(result)
         assert data["status"] == "error"
 
@@ -111,9 +111,9 @@ class TestSandboxTools:
 class TestSandboxWithDocker:
     """Tests that require Docker to be available."""
 
-    def test_sandbox_run_code_simple_command(self, sandbox_session):
+    def test_sandbox_bash_simple_command(self, sandbox_session):
         """Test running a simple command in sandbox."""
-        result = _run(sandbox_run_code(command="echo 'Hello, World!'"))
+        result = _run(sandbox_bash(command="echo 'Hello, World!'"))
         data = json.loads(result)
 
         assert data["status"] == "ok"
@@ -121,12 +121,12 @@ class TestSandboxWithDocker:
         assert data["returncode"] == 0
         assert isinstance(data["files_created"], list)
 
-    def test_sandbox_run_code_python(self, sandbox_session):
+    def test_sandbox_bash_python(self, sandbox_session):
         """Test running Python code in sandbox."""
-        result = _run(sandbox_run_code(command="python -c \"print('Python works!')\""))
+        result = _run(sandbox_bash(command="python -c \"print('Python works!')\""))
         data = json.loads(result)
 
-        assert data["status"] == "ok", f"sandbox_run_code failed: {data}"
+        assert data["status"] == "ok", f"sandbox_bash failed: {data}"
         assert "Python works!" in data["stdout"]
 
     def test_sandbox_install_packages_and_run(self, sandbox_session):
@@ -141,7 +141,7 @@ class TestSandboxWithDocker:
 
         # Run Python with the package
         run_result = _run(
-            sandbox_run_code(command="python -c 'import cowsay; cowsay.cow(\"moo\")'"),
+            sandbox_bash(command="python -c 'import cowsay; cowsay.cow(\"moo\")'"),
         )
         run_data = json.loads(run_result)
         assert run_data["status"] == "ok"
@@ -149,7 +149,7 @@ class TestSandboxWithDocker:
     def test_files_created_detection(self, sandbox_session):
         """Test that files_created detects new files after execution."""
         result = _run(
-            sandbox_run_code(command="echo 'test content' > /workspace/testfile.txt"),
+            sandbox_bash(command="echo 'test content' > /workspace/testfile.txt"),
         )
         data = json.loads(result)
 
@@ -159,7 +159,7 @@ class TestSandboxWithDocker:
     def test_sandbox_get_status_running(self, sandbox_session):
         """Test sandbox_get_status when container is running."""
         # First, create a container by running a command
-        _run(sandbox_run_code(command="echo hello"))
+        _run(sandbox_bash(command="echo hello"))
 
         result = _run(sandbox_get_status())
         data = json.loads(result)
@@ -170,18 +170,18 @@ class TestSandboxWithDocker:
         assert isinstance(data["disk_usage_mb"], int | float)
         assert isinstance(data["uptime_seconds"], int)
 
-    def test_sandbox_run_code_timeout(self, sandbox_session):
-        """Test that sandbox_run_code respects timeout."""
-        result = _run(sandbox_run_code(command="sleep 10", timeout=2))
+    def test_sandbox_bash_timeout(self, sandbox_session):
+        """Test that sandbox_bash respects timeout."""
+        result = _run(sandbox_bash(command="sleep 10", timeout=2))
         data = json.loads(result)
 
         assert data["status"] == "timeout"
         assert data["returncode"] == -1
 
-    def test_sandbox_run_code_with_network(self, sandbox_session):
-        """Test sandbox_run_code with temporary network access."""
+    def test_sandbox_bash_with_network(self, sandbox_session):
+        """Test sandbox_bash with temporary network access."""
         result = _run(
-            sandbox_run_code(
+            sandbox_bash(
                 command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
                 network=True,
                 timeout=30,
@@ -196,7 +196,7 @@ class TestSandboxWithDocker:
         session_id, tmp_path = sandbox_session
 
         # Create a file inside the sandbox
-        _run(sandbox_run_code(command="echo 'download test' > /workspace/dl_test.txt"))
+        _run(sandbox_bash(command="echo 'download test' > /workspace/dl_test.txt"))
 
         # Download it — returns base64 content
         result = _run(sandbox_download_file(path="dl_test.txt"))
@@ -215,7 +215,7 @@ class TestSandboxWithDocker:
         session_id, tmp_path = sandbox_session
 
         # Ensure sandbox is running
-        _run(sandbox_run_code(command="echo hello"))
+        _run(sandbox_bash(command="echo hello"))
 
         result = _run(sandbox_download_file(path="no_such_file.txt"))
         data = json.loads(result)
@@ -226,7 +226,7 @@ class TestSandboxWithDocker:
     def test_enable_disable_network(self, sandbox_session):
         """Test persistent network enable/disable tools."""
         # Create container first
-        _run(sandbox_run_code(command="echo hello"))
+        _run(sandbox_bash(command="echo hello"))
 
         # Enable persistent network
         result = _run(sandbox_enable_network())
@@ -234,10 +234,10 @@ class TestSandboxWithDocker:
         assert data["status"] == "ok"
         assert data["network_enabled"] is True
 
-        # Verify network works in sandbox_run_code without network=True flag
+        # Verify network works in sandbox_bash without network=True flag
         # (bridge stays connected since sandbox_enable_network connected it)
         result = _run(
-            sandbox_run_code(
+            sandbox_bash(
                 command="python -c \"import urllib.request; print(urllib.request.urlopen('http://example.com').status)\"",
                 timeout=30,
             ),

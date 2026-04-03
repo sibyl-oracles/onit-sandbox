@@ -7,7 +7,7 @@ container with resource limits, network isolation, and a shared home directory.
 
 Tools:
 - sandbox_install_packages: Install Python packages in the sandbox
-- sandbox_run_code: Execute commands in the isolated sandbox (supports background mode)
+- sandbox_bash: Execute commands in the isolated sandbox (supports background mode)
 - sandbox_check_job: Check status/output of background jobs
 - sandbox_get_status: Inspect sandbox state, packages, and resource usage
 - sandbox_write_file: Write files into the sandbox
@@ -1131,7 +1131,7 @@ No internet by default. Output is streamed in real time.
   Use sandbox_check_job to poll status and retrieve output. Ideal for long-running
   tasks like model training that would otherwise time out.""",
 )
-async def sandbox_run_code(
+async def sandbox_bash(
     command: Annotated[
         str | None, Field(description="Shell command to execute, e.g. 'python train.py'.")
     ] = None,
@@ -1182,7 +1182,8 @@ async def sandbox_run_code(
                 f"'({command}) > {job_dir}/stdout.log 2> {job_dir}/stderr.log; "
                 f"echo $? > {job_dir}/exitcode; "
                 f"echo done > {job_dir}/status' "
-                f"> /dev/null 2>&1 &"
+                f"> /dev/null 2>&1 & "
+                f"echo $! > {job_dir}/pid"
             )
 
             exit_code, output = _manager.exec_in_container(container_info.container_id, wrapper)
@@ -1192,15 +1193,24 @@ async def sandbox_run_code(
                     indent=2,
                 )
 
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "job_id": job_id,
-                    "session_id": sid,
-                    "message": f"Background job started. Use sandbox_check_job(job_id='{job_id}') to check status and retrieve output.",
-                },
-                indent=2,
+            # Read back the PID that was captured by the wrapper
+            _, pid_output = _manager.exec_in_container(
+                container_info.container_id,
+                f"cat {job_dir}/pid 2>/dev/null",
             )
+            job_pid = pid_output.strip() or None
+
+            result_data: dict[str, Any] = {
+                "status": "ok",
+                "job_id": job_id,
+                "session_id": sid,
+                "container_id": container_info.container_id[:12],
+                "message": f"Background job started. Use sandbox_check_job(job_id='{job_id}') to check status and retrieve output.",
+            }
+            if job_pid:
+                result_data["pid"] = int(job_pid)
+
+            return json.dumps(result_data, indent=2)
         except DockerNotAvailableError:
             return json.dumps({"status": "error", "error": "Docker is not available."}, indent=2)
         except Exception as e:
@@ -1281,7 +1291,7 @@ async def sandbox_run_code(
                 indent=2,
             )
         except Exception as e:
-            logger.exception("Error in sandbox_run_code")
+            logger.exception("Error in sandbox_bash")
             return json.dumps(
                 {
                     "status": "error",
@@ -1329,14 +1339,14 @@ async def sandbox_run_code(
 
 @mcp.tool(
     title="Check Background Job",
-    description="""Check the status of a background job launched with sandbox_run_code(background=True).
+    description="""Check the status of a background job launched with sandbox_bash(background=True).
 
-- job_id: The job ID returned by sandbox_run_code.
+- job_id: The job ID returned by sandbox_bash.
 - tail: Number of lines to return from the end of stdout/stderr (default 100). Use 0 for all output.""",
 )
 async def sandbox_check_job(
     job_id: Annotated[
-        str | None, Field(description="The job_id returned by sandbox_run_code.")
+        str | None, Field(description="The job_id returned by sandbox_bash.")
     ] = None,
     tail: Annotated[
         int, Field(description="Number of lines from end of stdout/stderr (default 100, 0=all).")
@@ -1369,6 +1379,44 @@ async def sandbox_check_job(
                     indent=2,
                 )
 
+            # If status file says "running", verify the process is actually alive.
+            # This catches cases where the process died without updating the status file
+            # (e.g. OOM kill, SIGKILL, container restart).
+            if job_status == "running":
+                _, pid_out = _manager.exec_in_container(
+                    container_info.container_id,
+                    f"cat {job_dir}/pid 2>/dev/null",
+                )
+                pid_str = pid_out.strip()
+                if pid_str:
+                    # kill -0 checks if process exists without sending a signal
+                    ec_alive, _ = _manager.exec_in_container(
+                        container_info.container_id,
+                        f"kill -0 {pid_str} 2>/dev/null",
+                    )
+                    if ec_alive != 0:
+                        # Process is dead but status was never updated — mark as done
+                        job_status = "done"
+                        # Try to read the exit code if the wrapper managed to write it
+                        _, ec_out = _manager.exec_in_container(
+                            container_info.container_id,
+                            f"cat {job_dir}/exitcode 2>/dev/null",
+                        )
+                        ec_str = ec_out.strip()
+                        if ec_str:
+                            try:
+                                dead_exitcode = int(ec_str)
+                            except ValueError:
+                                dead_exitcode = -1
+                        else:
+                            dead_exitcode = -1
+                        # Update the status file so future checks don't repeat this
+                        _manager.exec_in_container(
+                            container_info.container_id,
+                            f"echo done > {job_dir}/status && "
+                            f"([ -f {job_dir}/exitcode ] || echo {dead_exitcode} > {job_dir}/exitcode)",
+                        )
+
             # Read exit code if job is done
             returncode = None
             if job_status == "done":
@@ -1392,17 +1440,30 @@ async def sandbox_check_job(
                 f"{tail_cmd} {job_dir}/stderr.log 2>/dev/null",
             )
 
+            # Read PID for reporting
+            _, pid_out_check = _manager.exec_in_container(
+                container_info.container_id,
+                f"cat {job_dir}/pid 2>/dev/null",
+            )
+            job_pid_str = pid_out_check.strip()
+
             result: dict[str, Any] = {
                 "status": "ok",
                 "job_id": job_id,
                 "job_status": "running" if job_status == "running" else "completed",
                 "session_id": sid,
+                "container_id": container_info.container_id[:12],
                 "stdout": stdout[-MAX_OUTPUT_BYTES:],
                 "stderr": stderr[-MAX_OUTPUT_BYTES:],
             }
             if returncode is not None:
                 result["returncode"] = returncode
                 result["job_status"] = "completed"
+            if job_pid_str:
+                try:
+                    result["pid"] = int(job_pid_str)
+                except ValueError:
+                    pass
 
             return json.dumps(result, indent=2)
 
@@ -3329,9 +3390,9 @@ PATH includes:      /home/sandbox/.local/bin
 - Use /workspace for all code and output files.
 - Install packages with sandbox_install_packages (pip).
 - Network is disabled by default; use sandbox_enable_network or the
-  network=true flag on sandbox_run_code to access the internet.
+  network=true flag on sandbox_bash to access the internet.
 - Use sandbox_list_files to explore directory contents.
-- For long-running tasks (training, etc.), use sandbox_run_code with
+- For long-running tasks (training, etc.), use sandbox_bash with
   background=True to avoid timeouts. Check with sandbox_check_job.
 """
     return json.dumps({"status": "ok", "filesystem_info": info}, indent=2)
