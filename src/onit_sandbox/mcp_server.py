@@ -15,6 +15,7 @@ Tools:
 - sandbox_enable_network: Enable persistent internet access
 - sandbox_disable_network: Disable internet access
 - sandbox_stop: Stop and remove the sandbox container
+- sandbox_github_create_repo: Create a new private/public GitHub repository
 """
 
 from __future__ import annotations
@@ -2268,6 +2269,107 @@ async def sandbox_upload_file(
 
     return await _run_with_progress(ctx, _impl)
 
+
+
+@mcp.tool(
+    title="Create GitHub Repo",
+    description="""Create a new GitHub repository.
+
+Requires a GitHub Personal Access Token configured via 'onit-sandbox setup'.
+The repository is created under the authenticated user by default, or under
+a specified organization.  Returns the repo URL and clone URL on success.""",
+)
+async def sandbox_github_create_repo(
+    name: Annotated[
+        str,
+        Field(description="Repository name (e.g. 'my-project')."),
+    ],
+    description: Annotated[
+        str | None,
+        Field(description="Optional repository description."),
+    ] = None,
+    private: Annotated[
+        bool,
+        Field(description="Whether the repository should be private. Defaults to true."),
+    ] = True,
+    org: Annotated[
+        str | None,
+        Field(
+            description="GitHub organization to create the repo under. "
+            "If omitted, creates under the authenticated user."
+        ),
+    ] = None,
+    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
+    ctx: Context | None = None,
+) -> str:
+    import urllib.request
+    import urllib.error
+
+    def _impl() -> str:
+        token = _manager._load_github_token()
+        if not token:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "output": "GitHub token not configured. "
+                    "Run 'onit-sandbox setup' on the host to store a GitHub Personal Access Token.",
+                },
+                indent=2,
+            )
+
+        payload: dict[str, Any] = {"name": name, "private": private}
+        if description:
+            payload["description"] = description
+
+        if org:
+            api_url = f"https://api.github.com/orgs/{org}/repos"
+        else:
+            api_url = "https://api.github.com/user/repos"
+
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            api_url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = json.loads(resp.read().decode())
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "name": resp_data.get("full_name"),
+                        "url": resp_data.get("html_url"),
+                        "clone_url": resp_data.get("clone_url"),
+                        "ssh_url": resp_data.get("ssh_url"),
+                        "private": resp_data.get("private"),
+                    },
+                    indent=2,
+                )
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else ""
+            try:
+                error_detail = json.loads(error_body).get("message", error_body)
+            except (json.JSONDecodeError, AttributeError):
+                error_detail = error_body
+            return json.dumps(
+                {"status": "error", "output": f"GitHub API error {e.code}: {error_detail}"},
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps(
+                {"status": "error", "output": f"Request failed: {e}"},
+                indent=2,
+            )
+
+    return await asyncio.get_event_loop().run_in_executor(None, _impl)
 
 
 @mcp.tool(
