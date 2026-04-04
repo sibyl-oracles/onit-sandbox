@@ -19,7 +19,6 @@ from onit_sandbox.mcp_server import (
     sandbox_download_file,
     sandbox_enable_network,
     sandbox_get_status,
-    sandbox_install_packages,
     sandbox_bash,
 )
 
@@ -78,12 +77,6 @@ class TestSandboxTools:
         finally:
             mcp_module.SESSION_ID = None
 
-    def test_sandbox_install_packages_no_packages(self):
-        """Test sandbox_install_packages with no packages specified."""
-        result = _run(sandbox_install_packages(packages=None))
-        data = json.loads(result)
-        assert data["status"] == "error"
-
     def test_sandbox_bash_no_command(self):
         """Test sandbox_bash with no command specified."""
         result = _run(sandbox_bash(command=None))
@@ -129,17 +122,14 @@ class TestSandboxWithDocker:
         assert data["status"] == "ok", f"sandbox_bash failed: {data}"
         assert "Python works!" in data["stdout"]
 
-    def test_sandbox_install_packages_and_run(self, sandbox_session):
-        """Test installing a package and using it."""
-        # Install a small package
-        install_result = _run(sandbox_install_packages(packages="cowsay"))
+    def test_sandbox_pip_install_and_run(self, sandbox_session):
+        """Test installing a package via sandbox_bash and using it."""
+        install_result = _run(
+            sandbox_bash(command="pip install --user cowsay", network=True, timeout=60),
+        )
         install_data = json.loads(install_result)
-
         assert install_data["status"] == "ok"
-        assert isinstance(install_data["installed"], list)
-        assert len(install_data["installed"]) > 0
 
-        # Run Python with the package
         run_result = _run(
             sandbox_bash(command="python -c 'import cowsay; cowsay.cow(\"moo\")'"),
         )

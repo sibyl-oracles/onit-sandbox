@@ -2,44 +2,20 @@
 Sandbox MCP Server — tool definitions for safe code execution.
 
 Provides an isolated Docker-based sandbox for developing, running, and testing
-Python projects without affecting the host system. Each session gets its own
-container with resource limits, network isolation, and a shared home directory.
+projects without affecting the host system. Each session gets its own container
+with resource limits, network isolation, and a shared home directory.
 
 Tools:
-- sandbox_install_packages: Install Python packages in the sandbox
-- sandbox_bash: Execute commands in the isolated sandbox (supports background mode)
+- sandbox_bash: Execute shell commands (supports background mode, network, git, pip)
 - sandbox_check_job: Check status/output of background jobs
 - sandbox_get_status: Inspect sandbox state, packages, and resource usage
 - sandbox_write_file: Write files into the sandbox
-- sandbox_list_files: List files in the sandbox filesystem
 - sandbox_download_file: Copy a file from the sandbox to the local filesystem
 - sandbox_upload_file: Copy a file/directory from host into the sandbox
-- sandbox_read_file: Read file contents from the sandbox
 - sandbox_enable_network: Enable persistent internet access
 - sandbox_disable_network: Disable internet access
-- sandbox_stop: Stop and remove the sandbox container for the current session
-- sandbox_filesystem_info: Explain the sandbox filesystem layout and mounts
-
-Git tools (use 'onit-sandbox setup' for GitHub authentication):
-- sandbox_git_clone: Clone a repository into the sandbox
-- sandbox_git_status: Show working tree status
-- sandbox_git_add: Stage files for commit
-- sandbox_git_commit: Create a commit
-- sandbox_git_pull: Pull from a remote repository
-- sandbox_git_push: Push to a remote repository
-- sandbox_git_branch: List, create, or delete branches
-- sandbox_git_checkout: Switch branches or restore files
-- sandbox_git_log: Show commit history
-- sandbox_git_diff: Show changes between commits/working tree
-- sandbox_git_init: Initialize a new repository
-- sandbox_git_remote: Manage remote repositories
-- sandbox_git_stash: Stash or restore uncommitted changes
-- sandbox_github_create_repo: Create a new remote GitHub repository
+- sandbox_stop: Stop and remove the sandbox container
 """
-
-# WARNING: This file has high cyclomatic complexity (CC > 20)
-# This indicates complex conditional logic that may benefit from refactoring.
-# See analyze_complexity.py for details.
 
 from __future__ import annotations
 
@@ -48,9 +24,9 @@ import atexit
 import base64
 import functools
 import json
-import re
 import logging
 import os
+import platform
 import queue
 import signal
 import subprocess
@@ -77,7 +53,6 @@ from onit_sandbox.server import (
     DEFAULT_SHM_SIZE,
     DEFAULT_TIMEOUT,
     FALLBACK_IMAGE,
-    INSTALL_TIMEOUT,
     MAX_OUTPUT_BYTES,
     SANDBOX_IMAGE,
     SandboxMCPServer,
@@ -85,6 +60,21 @@ from onit_sandbox.server import (
 )
 
 logger = logging.getLogger(__name__)
+
+IS_MACOS = platform.system() == "Darwin"
+
+
+def _container_uid_gid() -> tuple[int, int]:
+    """Return (uid, gid) to use for the container's --user flag.
+
+    On Linux, use the host UID/GID so files on bind-mounted volumes have
+    correct ownership.  On macOS, Docker Desktop runs containers in a Linux VM
+    with transparent file-ownership mapping, so we use a fixed 1000:1000 to
+    avoid issues with the host UID (which may not exist in the container).
+    """
+    if IS_MACOS:
+        return 1000, 1000
+    return os.getuid(), os.getgid()
 
 
 @dataclass
@@ -311,7 +301,7 @@ class SandboxManager:
             "--dns",
             "8.8.4.4",
             "--user",
-            f"{os.getuid()}:{os.getgid()}",
+            f"{_container_uid_gid()[0]}:{_container_uid_gid()[1]}",
             "-e",
             "HOME=/home/sandbox",
             "-e",
@@ -384,7 +374,7 @@ class SandboxManager:
                     "sh",
                     "-c",
                     "mkdir -p /home/sandbox/.cache/pip /home/sandbox/.local"
-                    f" && chown -R {os.getuid()}:{os.getgid()} /home/sandbox",
+                    f" && chown -R {_container_uid_gid()[0]}:{_container_uid_gid()[1]} /home/sandbox",
                 ],
                 capture_output=True,
                 timeout=10,
@@ -425,7 +415,7 @@ class SandboxManager:
         raises ``KeyError`` because the host UID has no entry in the
         container's ``/etc/passwd``.
         """
-        uid, gid = os.getuid(), os.getgid()
+        uid, gid = _container_uid_gid()
         subprocess.run(
             [
                 "docker",
@@ -543,6 +533,34 @@ class SandboxManager:
             return False
 
     @staticmethod
+    def _is_container_dead_error(output: str) -> bool:
+        """Return True if the output indicates the container is dead or gone."""
+        markers = (
+            "no such container",
+            "is not running",
+            "is restarting",
+            "container is paused",
+            "has been removed",
+            "can not exec in a stopped",
+            "can not exec in a dead",
+        )
+        lower = output.lower()
+        return any(m in lower for m in markers)
+
+    @staticmethod
+    def _is_transient_docker_error(output: str) -> bool:
+        """Return True if the output indicates a transient Docker daemon error."""
+        markers = (
+            "connection refused",
+            "i/o timeout",
+            "daemon is not running",
+            "TLS handshake timeout",
+            "temporary failure",
+        )
+        lower = output.lower()
+        return any(m in lower for m in markers)
+
+    @staticmethod
     def _build_exec_cmd(
         container_id: str,
         command: str,
@@ -593,19 +611,30 @@ class SandboxManager:
 
         When split_output is True, returns (returncode, stdout, stderr).
         Otherwise returns (returncode, combined_output) for backward compat.
+        Retries once on transient Docker daemon errors.
         """
         cmd = self._build_exec_cmd(container_id, command, workdir, env)
 
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            if split_output:
-                return result.returncode, result.stdout, result.stderr
-            output = result.stdout + result.stderr
-            return result.returncode, output
-        except subprocess.TimeoutExpired:
-            if split_output:
-                return -1, "", f"Command timed out after {timeout} seconds"
-            return -1, f"Command timed out after {timeout} seconds"
+        for attempt in range(2):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                combined = result.stdout + result.stderr
+                # Retry on transient Docker errors (first attempt only)
+                if result.returncode != 0 and attempt == 0 and self._is_transient_docker_error(combined):
+                    logger.warning("Transient Docker error, retrying: %s", combined[:200])
+                    time.sleep(1)
+                    continue
+                if split_output:
+                    return result.returncode, result.stdout, result.stderr
+                return result.returncode, combined
+            except subprocess.TimeoutExpired:
+                if split_output:
+                    return -1, "", f"Command timed out after {timeout} seconds"
+                return -1, f"Command timed out after {timeout} seconds"
+        # Should not reach here, but satisfy type checker
+        if split_output:
+            return -1, "", "Execution failed after retries"
+        return -1, "Execution failed after retries"
 
     def exec_in_container_streaming(
         self,
@@ -1031,105 +1060,36 @@ async def _run_with_progress(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(
-    title="Install Python Packages",
-    description="""Install Python packages via pip. Network is enabled automatically during install.
-
-- packages: Space-separated package names, e.g. "numpy matplotlib scipy==1.12.0".""",
-)
-async def sandbox_install_packages(
-    packages: Annotated[
-        str | None,
-        Field(description="Space-separated package names, e.g. 'numpy matplotlib scipy==1.12.0'."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    if not packages:
-        return json.dumps({"status": "error", "error": "No packages specified"}, indent=2)
-
-    def _impl() -> str:
-        sid = _get_session_id(session_id)
-        data_path = _get_data_path(sid)
-
-        try:
-            container_info = _manager.get_or_create_container(
-                sid, data_path, extra_mounts=DATA_MOUNTS
-            )
-            if not _manager.enable_network(container_info.container_id):
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "installed": [],
-                        "output": "Failed to enable network access for pip install.",
-                    },
-                    indent=2,
-                )
-
-            try:
-                exit_code, output = _manager.exec_in_container(
-                    container_info.container_id,
-                    f"pip install --user {packages}",
-                    timeout=INSTALL_TIMEOUT,
-                )
-
-                installed = []
-                if exit_code == 0:
-                    # Parse successfully installed packages from pip output
-                    for line in output.split("\n"):
-                        if line.strip().startswith("Successfully installed"):
-                            installed = [pkg.rsplit("-", 1)[0] for pkg in line.strip().split()[2:]]
-                            break
-                    if not installed:
-                        # Fallback: assume requested packages were installed
-                        installed = [p for p in packages.split() if not p.startswith("-")]
-                    container_info.installed_packages.extend(installed)
-
-                return json.dumps(
-                    {
-                        "status": "ok" if exit_code == 0 else "error",
-                        "session_id": sid,
-                        "installed": installed,
-                        "output": output[-MAX_OUTPUT_BYTES:],
-                    },
-                    indent=2,
-                )
-            finally:
-                if not container_info.network_enabled:
-                    _manager.disable_network(container_info.container_id)
-
-        except DockerNotAvailableError:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "installed": [],
-                    "output": "Docker is not available. "
-                    "Please install Docker and ensure it is running.",
-                },
-                indent=2,
-            )
-        except Exception as e:
-            logger.exception("Error in sandbox_install_packages")
-            return json.dumps(
-                {"status": "error", "installed": [], "output": str(e)},
-                indent=2,
-            )
-
-    return await _run_with_progress(ctx, _impl)
-
 
 @mcp.tool(
-    title="Run Code",
-    description="""Execute a shell command in the isolated sandbox container. Only sandbox-local
-paths (e.g. /workspace) are accessible — host paths do not exist here.
+    title="Bash",
+    description="""Execute a shell command in the isolated sandbox container.
+Only sandbox-local paths are accessible — host paths do not exist here.
 No internet by default. Output is streamed in real time.
 
+Parameters:
 - command: Shell command to run (e.g. "python train.py --data-dir /data").
 - network: Temporarily enable internet for this command (default false).
+  Required for: pip install, git clone/pull/push/fetch, curl, wget, apt-get.
 - timeout: Max seconds before the command is killed (default: no limit).
-- background: Run the command in the background and return immediately with a job_id.
-  Use sandbox_check_job to poll status and retrieve output. Ideal for long-running
-  tasks like model training that would otherwise time out.""",
+- background: Run in the background and return a job_id immediately.
+  Use sandbox_check_job to poll status. Ideal for long-running training jobs.
+
+Filesystem layout:
+  /workspace          Working directory. All relative paths resolve here.
+    .cache/pip        Shared pip cache (persists across sessions).
+    .cache/huggingface  HuggingFace cache (models, datasets, tokenizers).
+    .local/bin        User-installed executables (on PATH).
+  /data               Host data directory (if mounted). Read-write.
+  /tmp                Temporary files. Cleared on container restart.
+
+Common operations:
+  Install packages:  sandbox_bash(command="pip install numpy torch", network=true)
+  Git clone:         sandbox_bash(command="git clone https://github.com/user/repo", network=true)
+  Git commit & push: sandbox_bash(command="git add -A && git commit -m 'msg' && git push", network=true)
+  List files:        sandbox_bash(command="ls -la /workspace")
+  Read file:         sandbox_bash(command="cat /workspace/train.py")
+  Find files:        sandbox_bash(command="find /workspace -name '*.py'")""",
 )
 async def sandbox_bash(
     command: Annotated[
@@ -1174,12 +1134,14 @@ async def sandbox_bash(
 
             # Create job directory and launch the command via nohup with output capture.
             # A wrapper script writes the PID, captures exit code, and marks completion.
+            # The trap EXIT ensures status is updated even on OOM kill or SIGTERM.
             wrapper = (
                 f"mkdir -p {job_dir} && "
                 f"echo 'running' > {job_dir}/status && "
                 f"echo {json.dumps(command)} > {job_dir}/command && "
-                f"nohup sh -c "
-                f"'({command}) > {job_dir}/stdout.log 2> {job_dir}/stderr.log; "
+                f"nohup sh -c '"
+                f"trap \"echo done > {job_dir}/status\" EXIT; "
+                f"({command}) > {job_dir}/stdout.log 2> {job_dir}/stderr.log; "
                 f"echo $? > {job_dir}/exitcode; "
                 f"echo done > {job_dir}/status' "
                 f"> /dev/null 2>&1 & "
@@ -1226,6 +1188,50 @@ async def sandbox_bash(
         """Callback invoked in the worker thread for each output line."""
         line_queue.put(line)
 
+    def _run_in_container(container_info: ContainerInfo, sid: str) -> str:
+        """Execute the command in the given container, managing temp network."""
+        temp_network = False
+        if network and not container_info.network_enabled:
+            temp_network = _manager.enable_network(container_info.container_id)
+
+        try:
+            files_before = _list_workspace_files(container_info.container_id)
+
+            exit_code, stdout, stderr = _manager.exec_in_container_streaming(
+                container_info.container_id,
+                command,
+                timeout=timeout,
+                on_output=_on_output,
+            )
+
+            files_after = _list_workspace_files(container_info.container_id)
+            files_created = sorted(files_after - files_before)
+
+            if exit_code == 0:
+                status = "ok"
+            elif "timed out" in stderr:
+                status = "timeout"
+            else:
+                status = "error"
+
+            result_payload: dict[str, Any] = {
+                "status": status,
+                "session_id": sid,
+                "stdout": stdout[-MAX_OUTPUT_BYTES:],
+                "stderr": stderr[-MAX_OUTPUT_BYTES:],
+                "returncode": exit_code,
+                "files_created": files_created,
+            }
+            if files_created:
+                result_payload["hint"] = (
+                    "These files exist only inside the sandbox container. "
+                    "Use the sandbox_download_file tool to copy them to your local filesystem."
+                )
+            return json.dumps(result_payload, indent=2)
+        finally:
+            if temp_network:
+                _manager.disable_network(container_info.container_id)
+
     def _impl() -> str:
         sid = _get_session_id(session_id)
         data_path = _get_data_path(sid)
@@ -1235,50 +1241,26 @@ async def sandbox_bash(
                 sid, data_path, extra_mounts=DATA_MOUNTS
             )
 
-            # Enable network temporarily if requested (and not already persistent)
-            temp_network = False
-            if network and not container_info.network_enabled:
-                temp_network = _manager.enable_network(container_info.container_id)
+            result_str = _run_in_container(container_info, sid)
 
-            try:
-                # Snapshot files before execution
-                files_before = _list_workspace_files(container_info.container_id)
-
-                exit_code, stdout, stderr = _manager.exec_in_container_streaming(
-                    container_info.container_id,
-                    command,
-                    timeout=timeout,
-                    on_output=_on_output,
+            # Check if the container died mid-execution; if so, recreate and retry once
+            result_data = json.loads(result_str)
+            if (
+                result_data.get("returncode") == -1
+                and _manager._is_container_dead_error(result_data.get("stderr", ""))
+            ):
+                logger.warning(
+                    "Container %s died during execution, recreating...",
+                    container_info.container_id[:12],
                 )
+                with _manager._lock:
+                    _manager._containers.pop(sid, None)
+                container_info = _manager.get_or_create_container(
+                    sid, data_path, extra_mounts=DATA_MOUNTS
+                )
+                result_str = _run_in_container(container_info, sid)
 
-                # Detect new files
-                files_after = _list_workspace_files(container_info.container_id)
-                files_created = sorted(files_after - files_before)
-
-                if exit_code == 0:
-                    status = "ok"
-                elif "timed out" in stderr:
-                    status = "timeout"
-                else:
-                    status = "error"
-
-                result_payload: dict[str, Any] = {
-                    "status": status,
-                    "session_id": sid,
-                    "stdout": stdout[-MAX_OUTPUT_BYTES:],
-                    "stderr": stderr[-MAX_OUTPUT_BYTES:],
-                    "returncode": exit_code,
-                    "files_created": files_created,
-                }
-                if files_created:
-                    result_payload["hint"] = (
-                        "These files exist only inside the sandbox container. "
-                        "Use the sandbox_download_file tool to copy them to your local filesystem."
-                    )
-                return json.dumps(result_payload, indent=2)
-            finally:
-                if temp_network:
-                    _manager.disable_network(container_info.container_id)
+            return result_str
 
         except DockerNotAvailableError:
             return json.dumps(
@@ -1667,83 +1649,6 @@ async def sandbox_write_file(
 
     return await _run_with_progress(ctx, _impl)
 
-
-@mcp.tool(
-    title="List Files in Sandbox",
-    description="""List files in the sandbox.
-Use absolute paths to explore data mounts (e.g. "/data").
-
-- path: Directory to list, relative to /workspace or absolute (default ".")
-- max_depth: Recursion depth 1-10 (default 3)""",
-)
-async def sandbox_list_files(
-    path: Annotated[
-        str, Field(description="Directory to list (relative to /workspace or absolute).")
-    ] = ".",
-    max_depth: Annotated[int, Field(description="Recursion depth, 1-10.")] = 3,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        sid = _get_session_id(session_id)
-        data_path = _get_data_path(sid)
-
-        try:
-            container_info = _manager.get_or_create_container(
-                sid, data_path, extra_mounts=DATA_MOUNTS
-            )
-
-            # Normalise to absolute path inside container
-            if not path.startswith("/"):
-                container_path = f"/workspace/{path}"
-            else:
-                container_path = path
-
-            clamped_depth = min(max(max_depth, 1), 10)
-
-            exit_code, output = _manager.exec_in_container(
-                container_info.container_id,
-                f"find '{container_path}' -maxdepth {clamped_depth} -not -path '*/\\.*' "
-                f"\\( -type f -o -type d \\) 2>/dev/null | sort | head -500",
-                timeout=15,
-            )
-
-            files: list[str] = []
-            if exit_code == 0 and output.strip():
-                files = [
-                    line.replace("/workspace/", "", 1)
-                    for line in output.strip().split("\n")
-                    if line.strip()
-                ]
-
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "session_id": sid,
-                    "path": path,
-                    "files": files,
-                    "count": len(files),
-                },
-                indent=2,
-            )
-
-        except DockerNotAvailableError:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "error": "Docker is not available.",
-                    "path": path,
-                },
-                indent=2,
-            )
-        except Exception as e:
-            logger.exception("Error in sandbox_list_files")
-            return json.dumps(
-                {"status": "error", "error": str(e), "path": path},
-                indent=2,
-            )
-
-    return await _run_with_progress(ctx, _impl)
 
 
 @mcp.tool(
@@ -2364,946 +2269,6 @@ async def sandbox_upload_file(
     return await _run_with_progress(ctx, _impl)
 
 
-@mcp.tool(
-    title="Read File from Sandbox",
-    description="""Read file contents from the sandbox.
-For large binary files, use sandbox_download_file.
-
-- path: Path in sandbox (relative to /workspace or absolute)
-- max_bytes: Max bytes to read (default 100000, cap 1MB)
-- offset: Byte offset to start from (default 0, useful for tailing logs)""",
-)
-async def sandbox_read_file(
-    path: Annotated[
-        str | None, Field(description="Path in sandbox (relative to /workspace or absolute).")
-    ] = None,
-    max_bytes: Annotated[int, Field(description="Max bytes to read (cap 1MB).")] = 100000,
-    offset: Annotated[
-        int, Field(description="Byte offset to start from (useful for tailing logs).")
-    ] = 0,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    if not path:
-        return json.dumps({"status": "error", "error": "No path specified"}, indent=2)
-
-    def _impl() -> str:
-        sid = _get_session_id(session_id)
-        data_path = _get_data_path(sid)
-
-        try:
-            container_info = _manager.get_or_create_container(
-                sid, data_path, extra_mounts=DATA_MOUNTS
-            )
-
-            # Normalise to absolute path inside container
-            if not path.startswith("/"):
-                container_path = f"/workspace/{path}"
-            else:
-                container_path = path
-
-            # Get file size first
-            exit_code, size_out = _manager.exec_in_container(
-                container_info.container_id,
-                f"stat -c '%s' '{container_path}' 2>/dev/null",
-                timeout=10,
-            )
-            if exit_code != 0:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "error": f"File not found or not readable: {container_path}",
-                    },
-                    indent=2,
-                )
-
-            try:
-                total_size = int(size_out.strip())
-            except (ValueError, TypeError):
-                total_size = 0
-
-            # Read content with dd for precise offset/length control
-            clamped_max = min(max_bytes, 1_000_000)  # hard cap at 1MB
-            dd_cmd = f"dd if='{container_path}' bs=1 skip={offset} count={clamped_max} 2>/dev/null"
-            exit_code, content = _manager.exec_in_container(
-                container_info.container_id,
-                dd_cmd,
-                timeout=30,
-            )
-
-            if exit_code != 0:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "error": f"Failed to read file: {container_path}",
-                    },
-                    indent=2,
-                )
-
-            truncated = (total_size - offset) > clamped_max
-
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "session_id": sid,
-                    "content": content,
-                    "size_bytes": total_size,
-                    "offset": offset,
-                    "bytes_read": len(content),
-                    "truncated": truncated,
-                },
-                indent=2,
-            )
-
-        except DockerNotAvailableError:
-            return json.dumps(
-                {"status": "error", "error": "Docker is not available."},
-                indent=2,
-            )
-        except Exception as e:
-            logger.exception("Error in sandbox_read_file")
-            return json.dumps(
-                {"status": "error", "error": str(e)},
-                indent=2,
-            )
-
-    return await _run_with_progress(ctx, _impl)
-
-
-# ---------------------------------------------------------------------------
-# Git MCP Tool definitions
-# ---------------------------------------------------------------------------
-
-# Matches SSH-style git URLs: git@github.com:user/repo.git
-_SSH_URL_RE = re.compile(r"^git@github\.com:(.+)$")
-
-
-def _ssh_to_https(url: str) -> str:
-    """Convert a GitHub SSH URL to HTTPS so the credential helper works.
-
-    ``git@github.com:user/repo.git`` → ``https://github.com/user/repo.git``
-
-    Non-SSH URLs are returned unchanged.
-    """
-    m = _SSH_URL_RE.match(url)
-    if m:
-        return f"https://github.com/{m.group(1)}"
-    return url
-
-
-def _run_git_command(
-    command: str,
-    session_id: str | None = None,
-    network: bool = False,
-    timeout: int = 60,
-) -> str:
-    """Run a git command inside the sandbox container.
-
-    Handles container creation, optional network access, and returns
-    a JSON-encoded result dict.
-    """
-    sid = _get_session_id(session_id)
-    data_path = _get_data_path(sid)
-
-    try:
-        container_info = _manager.get_or_create_container(sid, data_path, extra_mounts=DATA_MOUNTS)
-
-        temp_network = False
-        if network and not container_info.network_enabled:
-            temp_network = _manager.enable_network(container_info.container_id)
-            if not temp_network:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "session_id": sid,
-                        "output": "Failed to enable network for git operation. "
-                        "The container could not connect to the network.",
-                        "returncode": -1,
-                    },
-                    indent=2,
-                )
-
-        try:
-            exit_code, output = _manager.exec_in_container(
-                container_info.container_id,
-                command,
-                timeout=timeout,
-            )
-
-            # Detect authentication failures that git may not surface clearly
-            status = "ok" if exit_code == 0 else "error"
-            lower_output = output.lower()
-            if exit_code != 0 and (
-                "authentication" in lower_output
-                or "could not read username" in lower_output
-                or "permission denied" in lower_output
-                or "403" in output
-                or "401" in output
-            ):
-                output += (
-                    "\n\nHint: GitHub authentication may not be configured. "
-                    "Run 'onit-sandbox setup' on the host to store a GitHub token."
-                )
-
-            return json.dumps(
-                {
-                    "status": status,
-                    "session_id": sid,
-                    "output": output[-MAX_OUTPUT_BYTES:],
-                    "returncode": exit_code,
-                },
-                indent=2,
-            )
-        finally:
-            if temp_network:
-                _manager.disable_network(container_info.container_id)
-
-    except DockerNotAvailableError:
-        return json.dumps(
-            {
-                "status": "error",
-                "output": "Docker is not available. "
-                "Please install Docker and ensure it is running.",
-                "returncode": -1,
-            },
-            indent=2,
-        )
-    except Exception as e:
-        logger.exception("Error in git command: %s", command)
-        return json.dumps(
-            {"status": "error", "output": str(e), "returncode": -1},
-            indent=2,
-        )
-
-
-@mcp.tool(
-    title="Git Clone",
-    description="""Clone a git repository into the sandbox workspace.
-Network is enabled automatically during clone.
-
-- url: Repository URL (HTTPS). For private repos, run 'onit-sandbox setup' first.
-- path: Optional target directory name (relative to /workspace).""",
-)
-async def sandbox_git_clone(
-    url: Annotated[
-        str,
-        Field(
-            description="Repository URL to clone (HTTPS), e.g. 'https://github.com/user/repo.git'."
-        ),
-    ],
-    path: Annotated[
-        str | None,
-        Field(description="Target directory name relative to /workspace. Defaults to repo name."),
-    ] = None,
-    branch: Annotated[
-        str | None,
-        Field(description="Branch to clone. Defaults to the remote default branch."),
-    ] = None,
-    depth: Annotated[
-        int | None,
-        Field(description="Create a shallow clone with this many commits. Omit for full history."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        clone_url = _ssh_to_https(url)
-        cmd = "git clone"
-        if branch:
-            cmd += f" --branch {branch}"
-        if depth and depth > 0:
-            cmd += f" --depth {depth}"
-        cmd += f" {clone_url}"
-        if path:
-            cmd += f" {path}"
-        return _run_git_command(cmd, session_id=session_id, network=True, timeout=300)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Status",
-    description="""Show the working tree status of a git repository in the sandbox.
-
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_status(
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        return _run_git_command(f"{cd}git status", session_id=session_id)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Add",
-    description="""Stage files for the next commit.
-
-- files: Space-separated file paths or patterns to stage. Use '.' to stage all changes.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_add(
-    files: Annotated[
-        str,
-        Field(description="Files to stage, e.g. '.' or 'src/main.py tests/' or '-A'."),
-    ],
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        return _run_git_command(f"{cd}git add {files}", session_id=session_id)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Commit",
-    description="""Create a git commit with staged changes.
-
-- message: Commit message.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.
-- all: If true, automatically stage all modified/deleted files before committing (-a).""",
-)
-async def sandbox_git_commit(
-    message: Annotated[
-        str,
-        Field(description="Commit message."),
-    ],
-    all: Annotated[
-        bool,
-        Field(description="Stage all modified/deleted files before committing (-a flag)."),
-    ] = False,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        # Use heredoc to safely pass the commit message
-        all_flag = " -a" if all else ""
-        cmd = f"{cd}git commit{all_flag} -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
-        result = _run_git_command(cmd, session_id=session_id)
-
-        # Auto-recover: if nothing was staged, add all files and retry.
-        # AI clients frequently call commit without a prior git-add.
-        # - "no changes added to commit" → tracked files modified but unstaged
-        # - "nothing to commit (create/copy …)" → untracked files only (e.g. initial commit)
-        parsed = json.loads(result)
-        output = parsed.get("output", "")
-        if parsed.get("status") == "error" and (
-            "no changes added to commit" in output
-            or "nothing added to commit" in output
-            or ("nothing to commit" in output and "working tree clean" not in output)
-        ):
-            add_cmd = f"{cd}git add -A"
-            _run_git_command(add_cmd, session_id=session_id)
-            commit_cmd = f"{cd}git commit -m \"$(cat <<'COMMITMSG'\n{message}\nCOMMITMSG\n)\""
-            result = _run_git_command(commit_cmd, session_id=session_id)
-
-        return result
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Pull",
-    description="""Pull changes from a remote repository. Network is enabled automatically.
-
-- remote: Remote name (default: origin).
-- branch: Branch to pull. Defaults to current branch.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_pull(
-    remote: Annotated[
-        str,
-        Field(description="Remote name (default: origin)."),
-    ] = "origin",
-    branch: Annotated[
-        str | None,
-        Field(description="Branch to pull. Defaults to the current tracking branch."),
-    ] = None,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        branch_arg = f" {branch}" if branch else ""
-        return _run_git_command(
-            f"{cd}git pull {remote}{branch_arg}",
-            session_id=session_id,
-            network=True,
-        )
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Push",
-    description="""Push commits to a remote repository. Network is enabled automatically.
-For private repos, run 'onit-sandbox setup' to configure GitHub authentication first.
-
-- remote: Remote name (default: origin).
-- branch: Branch to push. Defaults to current branch.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_push(
-    remote: Annotated[
-        str,
-        Field(description="Remote name (default: origin)."),
-    ] = "origin",
-    branch: Annotated[
-        str | None,
-        Field(description="Branch to push. Defaults to the current branch."),
-    ] = None,
-    set_upstream: Annotated[
-        bool,
-        Field(description="Set upstream tracking reference (-u flag)."),
-    ] = False,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        upstream_flag = " -u" if set_upstream else ""
-        branch_arg = f" {branch}" if branch else ""
-
-        # When -u is requested without an explicit branch, resolve the current
-        # branch name so git knows which ref to push (push.default=simple
-        # won't infer it without a configured upstream).
-        if set_upstream and not branch_arg:
-            detect_result = _run_git_command(
-                f"{cd}git rev-parse --abbrev-ref HEAD",
-                session_id=session_id,
-                timeout=10,
-            )
-            detect_parsed = json.loads(detect_result)
-            if detect_parsed.get("status") == "ok":
-                current_branch = detect_parsed["output"].strip()
-                if current_branch and current_branch != "HEAD":
-                    branch_arg = f" {current_branch}"
-
-        # Use --porcelain for machine-readable output and 2>&1 to capture
-        # progress/errors from stderr
-        result = _run_git_command(
-            f"{cd}git push --porcelain{upstream_flag} {remote}{branch_arg} 2>&1",
-            session_id=session_id,
-            network=True,
-            timeout=120,
-        )
-        # Auto-retry with --set-upstream when the branch has no upstream.
-        # When no branch is specified, extract the branch name from the error
-        # message so git knows which ref to push (push.default=simple won't
-        # infer it without a configured upstream).
-        parsed = json.loads(result)
-        if (
-            parsed.get("status") == "error"
-            and "has no upstream branch" in parsed.get("output", "")
-            and not set_upstream
-        ):
-            retry_branch_arg = branch_arg
-            if not retry_branch_arg:
-                m = re.search(
-                    r"The current branch (\S+) has no upstream branch",
-                    parsed.get("output", ""),
-                )
-                if m:
-                    retry_branch_arg = f" {m.group(1)}"
-            result = _run_git_command(
-                f"{cd}git push --porcelain -u {remote}{retry_branch_arg} 2>&1",
-                session_id=session_id,
-                network=True,
-                timeout=120,
-            )
-            parsed = json.loads(result)
-
-        # Parse the result to add clarity about what happened
-        if parsed.get("status") == "ok":
-            output = parsed.get("output", "")
-            if "rejected" in output:
-                parsed["status"] = "error"
-                parsed["output"] = output + (
-                    "\n\nPush was rejected by the remote. "
-                    "You may need to pull first or force push."
-                )
-            elif "up to date" in output.lower() or "[up to date]" in output:
-                parsed["output"] = output + (
-                    "\n\nNothing was pushed — the remote already has these commits."
-                )
-        return json.dumps(parsed, indent=2)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Branch",
-    description="""List, create, or delete branches.
-
-- name: Branch name to create. Omit to list branches.
-- delete: If true, delete the named branch.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_branch(
-    name: Annotated[
-        str | None,
-        Field(description="Branch name to create. Omit to list all branches."),
-    ] = None,
-    delete: Annotated[
-        bool,
-        Field(description="Delete the named branch instead of creating it."),
-    ] = False,
-    all: Annotated[
-        bool,
-        Field(description="List both local and remote-tracking branches (-a)."),
-    ] = False,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        if name and delete:
-            cmd = f"{cd}git branch -d {name}"
-        elif name:
-            cmd = f"{cd}git branch {name}"
-        else:
-            all_flag = " -a" if all else ""
-            cmd = f"{cd}git branch{all_flag}"
-        return _run_git_command(cmd, session_id=session_id)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Checkout",
-    description="""Switch branches or restore working tree files.
-
-- target: Branch name, tag, or commit hash to check out.
-- create: If true, create a new branch and switch to it (-b flag).
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_checkout(
-    target: Annotated[
-        str,
-        Field(description="Branch name, tag, or commit hash to check out."),
-    ],
-    create: Annotated[
-        bool,
-        Field(description="Create a new branch and switch to it (-b flag)."),
-    ] = False,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        create_flag = " -b" if create else ""
-        return _run_git_command(f"{cd}git checkout{create_flag} {target}", session_id=session_id)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Log",
-    description="""Show commit history.
-
-- max_count: Maximum number of commits to show (default: 20).
-- oneline: If true, use condensed one-line format.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_log(
-    max_count: Annotated[
-        int,
-        Field(description="Maximum number of commits to show."),
-    ] = 20,
-    oneline: Annotated[
-        bool,
-        Field(description="Use condensed one-line format (--oneline)."),
-    ] = True,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        oneline_flag = " --oneline" if oneline else ""
-        return _run_git_command(
-            f"{cd}git log -n {max_count}{oneline_flag}",
-            session_id=session_id,
-        )
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Diff",
-    description="""Show changes between commits, working tree, and staging area.
-
-- staged: If true, show staged changes (--cached/--staged).
-- target: Compare against a specific commit, branch, or ref.
-- path: Directory of the git repo (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_diff(
-    staged: Annotated[
-        bool,
-        Field(description="Show only staged changes (--staged)."),
-    ] = False,
-    target: Annotated[
-        str | None,
-        Field(
-            description="Compare against a specific commit, branch, or ref (e.g. 'HEAD~1', 'main')."
-        ),
-    ] = None,
-    files: Annotated[
-        str | None,
-        Field(description="Limit diff to specific files (space-separated paths)."),
-    ] = None,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        staged_flag = " --staged" if staged else ""
-        target_arg = f" {target}" if target else ""
-        files_arg = f" -- {files}" if files else ""
-        return _run_git_command(
-            f"{cd}git diff{staged_flag}{target_arg}{files_arg}",
-            session_id=session_id,
-        )
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Init",
-    description="""Initialize a new git repository in the sandbox workspace.
-
-- path: Directory to initialize (relative to /workspace). Defaults to /workspace.""",
-)
-async def sandbox_git_init(
-    path: Annotated[
-        str | None,
-        Field(
-            description="Directory to initialize relative to /workspace. Defaults to /workspace."
-        ),
-    ] = None,
-    default_branch: Annotated[
-        str | None,
-        Field(description="Name for the initial branch (e.g. 'main'). Defaults to git's default."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        target = f"/workspace/{path}" if path else "/workspace"
-        branch_flag = f" --initial-branch={default_branch}" if default_branch else ""
-        return _run_git_command(f"git init{branch_flag} {target}", session_id=session_id)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Remote",
-    description="""Manage remote repositories.
-
-- action: 'list' (default), 'add', or 'remove'.
-- name: Remote name (required for add/remove).
-- url: Remote URL (required for add).""",
-)
-async def sandbox_git_remote(
-    action: Annotated[
-        str,
-        Field(description="Action: 'list', 'add', or 'remove'."),
-    ] = "list",
-    name: Annotated[
-        str | None,
-        Field(description="Remote name (required for add/remove)."),
-    ] = None,
-    url: Annotated[
-        str | None,
-        Field(description="Remote URL (required for add)."),
-    ] = None,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        if action == "add":
-            if not name or not url:
-                return json.dumps(
-                    {"status": "error", "output": "Both 'name' and 'url' are required for 'add'."},
-                    indent=2,
-                )
-            cmd = f"{cd}git remote add {name} {_ssh_to_https(url)}"
-        elif action == "remove":
-            if not name:
-                return json.dumps(
-                    {"status": "error", "output": "'name' is required for 'remove'."},
-                    indent=2,
-                )
-            cmd = f"{cd}git remote remove {name}"
-        else:
-            cmd = f"{cd}git remote -v"
-        return _run_git_command(cmd, session_id=session_id)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Stash",
-    description="""Stash or restore uncommitted changes.
-
-- action: 'push' (default), 'pop', 'list', 'apply', or 'drop'.
-- message: Optional message for stash push.""",
-)
-async def sandbox_git_stash(
-    action: Annotated[
-        str,
-        Field(description="Action: 'push' (default), 'pop', 'list', 'apply', or 'drop'."),
-    ] = "push",
-    message: Annotated[
-        str | None,
-        Field(description="Optional message for stash push."),
-    ] = None,
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        cd = f"cd /workspace/{path} && " if path else ""
-        if action == "push" and message:
-            cmd = f'{cd}git stash push -m "{message}"'
-        else:
-            cmd = f"{cd}git stash {action}"
-        return _run_git_command(cmd, session_id=session_id)
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="Git Auth Status",
-    description="""Check whether GitHub authentication is configured in the sandbox.
-Verifies the credential helper and token availability. Call this before push/pull
-to private repos if you encounter authentication errors.""",
-)
-async def sandbox_git_auth_status(
-    path: Annotated[
-        str | None,
-        Field(description="Git repo directory relative to /workspace. Defaults to /workspace."),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    def _impl() -> str:
-        sid = _get_session_id(session_id)
-        data_path = _get_data_path(sid)
-
-        try:
-            container_info = _manager.get_or_create_container(
-                sid, data_path, extra_mounts=DATA_MOUNTS
-            )
-
-            cd = f"cd /workspace/{path} && " if path else ""
-            # Check: 1) credential helper configured, 2) GITHUB_TOKEN env var set,
-            # 3) helper script exists
-            check_script = (
-                f"{cd}"
-                "echo '=== Credential Helper ===' && "
-                "git config --global credential.helper && "
-                "echo '=== Token Available ===' && "
-                '([ -n "$GITHUB_TOKEN" ] && echo "yes (${#GITHUB_TOKEN} chars)" || echo "no") && '
-                "echo '=== Helper Script ===' && "
-                "([ -x /home/sandbox/.local/bin/git-credential-github-token ] && echo 'exists' || echo 'missing') && "
-                "echo '=== Git User Config ===' && "
-                "git config --global user.name 2>/dev/null || echo '(not set)' && "
-                "git config --global user.email 2>/dev/null || echo '(not set)'"
-            )
-            exit_code, output = _manager.exec_in_container(
-                container_info.container_id,
-                check_script,
-                timeout=10,
-            )
-
-            # Determine overall auth readiness
-            has_token = "yes (" in output
-            has_helper = "exists" in output
-            auth_ready = has_token and has_helper
-
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "session_id": sid,
-                    "auth_configured": auth_ready,
-                    "details": output.strip(),
-                    "hint": (
-                        None
-                        if auth_ready
-                        else "GitHub token not configured. Run 'onit-sandbox setup' on the host to store a GitHub Personal Access Token."
-                    ),
-                },
-                indent=2,
-            )
-        except Exception as e:
-            return json.dumps(
-                {"status": "error", "output": str(e)},
-                indent=2,
-            )
-
-    return await _run_with_progress(ctx, _impl)
-
-
-@mcp.tool(
-    title="GitHub Create Repo",
-    description="""Create a new remote GitHub repository using the stored GitHub token.
-
-Requires GitHub authentication to be configured via 'onit-sandbox setup'.
-
-- name: Repository name (required).
-- description: Optional repository description.
-- private: Whether the repo should be private (default: true).
-- org: Optional GitHub organization. If omitted, creates under the authenticated user.""",
-)
-async def sandbox_github_create_repo(
-    name: Annotated[
-        str,
-        Field(description="Repository name (e.g. 'my-project')."),
-    ],
-    description: Annotated[
-        str | None,
-        Field(description="Optional repository description."),
-    ] = None,
-    private: Annotated[
-        bool,
-        Field(description="Whether the repository should be private. Defaults to true."),
-    ] = True,
-    org: Annotated[
-        str | None,
-        Field(
-            description="GitHub organization to create the repo under. "
-            "If omitted, creates under the authenticated user."
-        ),
-    ] = None,
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    import urllib.request
-    import urllib.error
-
-    def _impl() -> str:
-        token = _manager._load_github_token()
-        if not token:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "output": "GitHub token not configured. "
-                    "Run 'onit-sandbox setup' on the host to store a GitHub Personal Access Token.",
-                },
-                indent=2,
-            )
-
-        payload: dict[str, Any] = {
-            "name": name,
-            "private": private,
-        }
-        if description:
-            payload["description"] = description
-
-        if org:
-            api_url = f"https://api.github.com/orgs/{org}/repos"
-        else:
-            api_url = "https://api.github.com/user/repos"
-
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            api_url,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp_data = json.loads(resp.read().decode())
-                return json.dumps(
-                    {
-                        "status": "ok",
-                        "name": resp_data.get("full_name"),
-                        "url": resp_data.get("html_url"),
-                        "clone_url": resp_data.get("clone_url"),
-                        "ssh_url": resp_data.get("ssh_url"),
-                        "private": resp_data.get("private"),
-                    },
-                    indent=2,
-                )
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode() if e.fp else ""
-            try:
-                error_detail = json.loads(error_body).get("message", error_body)
-            except (json.JSONDecodeError, AttributeError):
-                error_detail = error_body
-            return json.dumps(
-                {
-                    "status": "error",
-                    "http_status": e.code,
-                    "output": error_detail,
-                },
-                indent=2,
-            )
-        except urllib.error.URLError as e:
-            return json.dumps(
-                {"status": "error", "output": f"Network error: {e.reason}"},
-                indent=2,
-            )
-
-    return await _run_with_progress(ctx, _impl)
-
 
 @mcp.tool(
     title="Stop Sandbox",
@@ -3343,59 +2308,6 @@ async def sandbox_stop(
         indent=2,
     )
 
-
-@mcp.tool(
-    title="Sandbox Filesystem Info",
-    description="""Explains the filesystem layout inside the sandbox container.
-Returns a description of key directories, their purpose, and current mount configuration.
-Call this tool first to orient yourself before working with files in the sandbox.""",
-)
-async def sandbox_filesystem_info(
-    session_id: Annotated[str | None, Field(description="Session identifier.")] = None,
-    ctx: Context | None = None,
-) -> str:
-    mounts_info = []
-    for m in DATA_MOUNTS:
-        mounts_info.append(f"  {m['container']}  (mounted from host, mode: {m['mode']})")
-
-    mounts_section = "\n".join(mounts_info) if mounts_info else "  (none configured)"
-
-    info = f"""\
-=== Sandbox Container Filesystem Layout ===
-
-/workspace       Default home directory and working directory. This is
-                    where you should create, edit, and run code. All relative
-                    paths resolve here.
-  .cache/pip        Shared pip cache — persists across sessions for faster
-                    package installs.
-  .cache/huggingface  HuggingFace cache (models, datasets, tokenizers).
-  .local/bin        User-installed executables (on PATH).
-
-/data               Optional data directory. Mounted read-write by default
-                    for datasets, pre-processed caches, CSVs, or other files
-                    the agent may read and write.
-
-/tmp                Temporary files. Cleared on container restart.
-
---- Environment ---
-USER:               sandbox (uid 1000)
-HOME:               /home/sandbox
-HF_HOME:            /home/sandbox/.cache/huggingface
-PATH includes:      /home/sandbox/.local/bin
-
---- Active Data Mounts ---
-{mounts_section}
-
---- Tips ---
-- Use /workspace for all code and output files.
-- Install packages with sandbox_install_packages (pip).
-- Network is disabled by default; use sandbox_enable_network or the
-  network=true flag on sandbox_bash to access the internet.
-- Use sandbox_list_files to explore directory contents.
-- For long-running tasks (training, etc.), use sandbox_bash with
-  background=True to avoid timeouts. Check with sandbox_check_job.
-"""
-    return json.dumps({"status": "ok", "filesystem_info": info}, indent=2)
 
 
 # ---------------------------------------------------------------------------

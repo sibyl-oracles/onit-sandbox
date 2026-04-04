@@ -13,7 +13,7 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 
 - **Install any package** — `pip install numpy matplotlib torch` just works
 - **Run full projects** — execute scripts, run tests, build simulations
-- **Git operations** — clone, commit, push, pull, branch — all inside the sandbox
+- **Git operations** — clone, commit, push, pull, branch — via `sandbox_bash` with `network=true`
 - **Mount data volumes** — bind host directories (datasets, models) into the sandbox
 - **Data pipelines** — upload files, run training, read metrics, download artifacts
 - **Stay secure** — containers are resource-limited, network-isolated, and non-root
@@ -25,13 +25,11 @@ Traditional bash-based MCP tools block package managers and restrict operations.
 │  LLM Agent (chat loop)              │
 │  ┌────────────────────────────────┐  │
 │  │ SandboxMCPServer               │  │
-│  │  install_packages              │  │
-│  │  run_code                      │  │
-│  │  write_file / read_file        │  │
-│  │  upload_file / download_file   │  │
-│  │  list_files / sandbox_status   │  │
+│  │  sandbox_bash (shell, pip, git)│  │
+│  │  write_file / upload_file      │  │
+│  │  download_file / check_job     │  │
+│  │  get_status / stop             │  │
 │  │  enable_network / disable_net  │  │
-│  │  git_clone / git_commit / …    │  │
 │  └──────────┬─────────────────────┘  │
 │             │ Docker CLI              │
 │  ┌──────────▼─────────────────────┐  │
@@ -158,7 +156,7 @@ Pre-installed packages:
 | peft | Parameter-efficient fine-tuning (LoRA, QLoRA) |
 | flash-attn | Flash Attention (requires CUDA at build time) |
 
-> **Fallback:** If no custom image is found, the server falls back to `python:3.12-slim` automatically. Packages can still be installed at runtime via `install_packages`.
+> **Fallback:** If no custom image is found, the server falls back to `python:3.12-slim` automatically. Packages can still be installed at runtime via `sandbox_bash(command="pip install ...", network=true)`.
 
 ### Step 3 — Start the server
 
@@ -216,27 +214,55 @@ Create a token at [github.com/settings/tokens](https://github.com/settings/token
 
 ## MCP Tools
 
-### `sandbox_install_packages`
-
-Install Python packages inside the sandbox via pip. Network is temporarily enabled for PyPI access, then disabled again.
-
-```json
-{
-  "packages": "numpy matplotlib scipy",
-  "session_id": "my-session"
-}
-```
-
 ### `sandbox_bash`
 
-Execute shell commands inside the sandbox. Output is captured and returned (configurable limit, default 50 KB). Automatically detects newly created files.
+Execute shell commands inside the sandbox. This is the primary tool — use it for running code, installing packages, git operations, file browsing, and anything else you'd do in a terminal. Output is streamed in real time. Automatically detects newly created files.
 
 ```json
 {
   "command": "python train.py --epochs 10",
   "timeout": 3600,
   "network": false,
+  "background": false,
   "session_id": "my-session"
+}
+```
+
+**Common operations via `sandbox_bash`:**
+
+```
+# Install packages (requires network=true)
+sandbox_bash(command="pip install numpy torch", network=true)
+
+# Git clone (requires network=true)
+sandbox_bash(command="git clone https://github.com/user/repo.git", network=true)
+
+# Git commit and push
+sandbox_bash(command="cd repo && git add -A && git commit -m 'msg' && git push", network=true)
+
+# List files
+sandbox_bash(command="ls -la /workspace")
+
+# Read a file
+sandbox_bash(command="cat train.py")
+
+# Long-running training (background mode)
+sandbox_bash(command="python train.py", background=true)
+```
+
+**Fault tolerance:**
+- If the container dies mid-execution (OOM, Docker restart), the command is automatically retried once with a fresh container.
+- Transient Docker daemon errors (connection refused, timeout) are retried with a 1-second backoff.
+- Background jobs use `trap EXIT` to update status even on unexpected termination.
+
+### `sandbox_check_job`
+
+Check the status of a background job launched with `sandbox_bash(background=true)`. Verifies the process is actually alive (not just relying on status files).
+
+```json
+{
+  "job_id": "abc123def456",
+  "tail": 100
 }
 ```
 
@@ -246,58 +272,30 @@ Write inline content to a file inside the sandbox. Parent directories are create
 
 ```json
 {
-  "file_path": "train.py",
-  "content": "import torch\n...",
-  "session_id": "my-session"
-}
-```
-
-### `sandbox_read_file`
-
-Read file contents from inside the sandbox without copying to the host. Supports offset and max_bytes for tailing large log files.
-
-```json
-{
-  "file_path": "output/metrics.json",
-  "max_bytes": 100000,
-  "offset": 0,
-  "session_id": "my-session"
+  "path": "train.py",
+  "content": "import torch\n..."
 }
 ```
 
 ### `sandbox_upload_file`
 
-Copy a file or directory from the host filesystem into the sandbox. Ideal for large datasets, model weights, or configuration archives.
+Copy a file or directory from the host filesystem into the sandbox.
 
 ```json
 {
-  "host_path": "/data/train.csv",
-  "sandbox_path": "data/train.csv",
-  "session_id": "my-session"
+  "src": "/data/train.csv",
+  "dest": "data/train.csv"
 }
 ```
 
 ### `sandbox_download_file`
 
-Copy a file from the sandbox to the host filesystem. Use for retrieving plots, CSVs, model checkpoints, or any output artifacts.
+Copy a file from the sandbox to the host filesystem.
 
 ```json
 {
-  "sandbox_path": "checkpoints/model_best.pt",
-  "dest_path": "/home/user/results/model_best.pt",
-  "session_id": "my-session"
-}
-```
-
-### `sandbox_list_files`
-
-List files and directories inside the sandbox. Supports recursive depth control.
-
-```json
-{
-  "path": ".",
-  "max_depth": 3,
-  "session_id": "my-session"
+  "path": "checkpoints/model_best.pt",
+  "dest": "/home/user/results/model_best.pt"
 }
 ```
 
@@ -305,192 +303,23 @@ List files and directories inside the sandbox. Supports recursive depth control.
 
 Check sandbox state — container health, Python version, installed packages, disk usage, uptime, GPU availability, network state, and configured data mounts.
 
-```json
-{
-  "session_id": "my-session"
-}
-```
-
 ### `sandbox_enable_network` / `sandbox_disable_network`
 
 Toggle persistent internet access. Use `enable_network` before downloading datasets or calling APIs, then `disable_network` to restore isolation.
 
-### Git Tools
+### `sandbox_stop`
 
-All git tools operate inside the sandbox container. For private repos, run `onit-sandbox setup` first to configure authentication. Network is automatically enabled for operations that need it (clone, pull, push).
-
-**Auto-recovery:** Git tools automatically handle common first-use issues so agents don't waste tool calls on predictable failures:
-- **Identity** — `user.name`, `user.email`, and `init.defaultBranch main` are pre-configured in every container.
-- **Push upstream** — if `git push` fails because the branch has no upstream, it automatically retries with `-u`.
-- **Unstaged changes** — if `git commit` fails because changes exist but aren't staged, it automatically retries with `-a`.
-
-#### `sandbox_git_clone`
-
-Clone a repository into the sandbox workspace.
-
-```json
-{
-  "url": "https://github.com/user/repo.git",
-  "branch": "main",
-  "depth": 1,
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_status`
-
-Show working tree status.
-
-```json
-{
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_add`
-
-Stage files for the next commit.
-
-```json
-{
-  "files": ".",
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_commit`
-
-Create a commit with staged changes.
-
-```json
-{
-  "message": "Add training script",
-  "all": true,
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_pull`
-
-Pull changes from a remote.
-
-```json
-{
-  "remote": "origin",
-  "branch": "main",
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_push`
-
-Push commits to a remote.
-
-```json
-{
-  "remote": "origin",
-  "branch": "main",
-  "set_upstream": true,
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_branch`
-
-List, create, or delete branches.
-
-```json
-{
-  "name": "feature/training",
-  "delete": false,
-  "all": false,
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_checkout`
-
-Switch branches or restore files.
-
-```json
-{
-  "target": "feature/training",
-  "create": true,
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_log`
-
-Show commit history.
-
-```json
-{
-  "max_count": 10,
-  "oneline": true,
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_diff`
-
-Show changes between commits or working tree.
-
-```json
-{
-  "staged": false,
-  "target": "HEAD~1",
-  "files": "src/",
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_init`
-
-Initialize a new git repository.
-
-```json
-{
-  "path": "new-project",
-  "default_branch": "main"
-}
-```
-
-#### `sandbox_git_remote`
-
-Manage remote repositories.
-
-```json
-{
-  "action": "add",
-  "name": "origin",
-  "url": "https://github.com/user/repo.git",
-  "path": "my-repo"
-}
-```
-
-#### `sandbox_git_stash`
-
-Stash or restore uncommitted changes.
-
-```json
-{
-  "action": "push",
-  "message": "WIP: training changes",
-  "path": "my-repo"
-}
-```
+Stop and remove the sandbox container for the current session.
 
 ### Example: Git Workflow in the Sandbox
 
 ```
-1. sandbox_git_clone(url="https://github.com/user/ml-project.git")
-2. sandbox_git_checkout(target="experiment/new-loss", create=true, path="ml-project")
-3. sandbox_write_file(file_path="ml-project/train.py", content="...")
+1. sandbox_bash(command="git clone https://github.com/user/ml-project.git", network=true)
+2. sandbox_bash(command="cd ml-project && git checkout -b experiment/new-loss")
+3. sandbox_write_file(path="ml-project/train.py", content="...")
 4. sandbox_bash(command="cd ml-project && python train.py")
-5. sandbox_git_add(files=".", path="ml-project")
-6. sandbox_git_commit(message="Add new loss function", path="ml-project")
-7. sandbox_git_push(set_upstream=true, path="ml-project")
+5. sandbox_bash(command="cd ml-project && git add -A && git commit -m 'Add new loss function'")
+6. sandbox_bash(command="cd ml-project && git push -u origin experiment/new-loss", network=true)
 ```
 
 ## Data Mounts
@@ -537,11 +366,11 @@ onit-sandbox start \
 
 The AI agent can then:
 
-1. List available data: `sandbox_list_files(path="/data")`
-2. Write training code: `sandbox_write_file(file_path="train.py", content="...")`
+1. List available data: `sandbox_bash(command="ls -la /data")`
+2. Write training code: `sandbox_write_file(path="train.py", content="...")`
 3. Run training: `sandbox_bash(command="python train.py", timeout=3600)`
 4. Cache pre-processed datasets: results saved directly to `/data` for reuse across sessions
-5. Monitor progress: `sandbox_read_file(file_path="train.log")`
+5. Monitor progress: `sandbox_bash(command="tail -100 train.log")`
 6. Results are written directly to `/results` on the host
 
 ## Configuration
@@ -586,7 +415,6 @@ onit-sandbox status     Check server status
 | `SANDBOX_SHM_SIZE` | `16g` | Shared memory size (`/dev/shm`) for PyTorch DataLoader workers |
 | `SANDBOX_DEFAULT_TIMEOUT` | `600` | Default command timeout (seconds) |
 | `SANDBOX_MAX_TIMEOUT` | `86400` | Maximum command timeout — 24 hours (seconds) |
-| `SANDBOX_INSTALL_TIMEOUT` | `600` | Package install timeout (seconds) |
 | `SANDBOX_PIP_CACHE_PATH` | `/tmp/onit/pip-cache` | Shared pip cache across sessions |
 | `SANDBOX_DATA_MOUNTS` | *(empty)* | Comma-separated mount specs (e.g. `/data:/data`). Mode defaults to `rw`; use `:ro` for read-only. |
 | `SANDBOX_GPU_DEVICES` | `all` | GPU device(s) to expose (e.g. `0`, `0,1`, `all`). Falls back to `CUDA_VISIBLE_DEVICES` if unset. |
@@ -656,7 +484,7 @@ cleanup_sandbox(session_id="my-session")
 | Filesystem | Container isolation — only home directory and explicit mounts are accessible |
 | User | Non-root execution as `sandbox` (UID 1000) |
 | Resources | Memory (64 GB), CPU (no limit), PIDs (4096), shared memory (16 GB) |
-| Network | Disabled by default — enabled only during `install_packages`, git clone/push/pull, or on request |
+| Network | Disabled by default — enabled per-command with `network=true` or persistently with `sandbox_enable_network` |
 | Lifecycle | Containers auto-removed on stop (`--rm` flag) |
 | GPU | Optional NVIDIA GPU passthrough when available |
 | Data mounts | Default to read-write for caching pre-processed data; use `:ro` to restrict |
@@ -671,7 +499,7 @@ cleanup_sandbox(session_id="my-session")
 
 ### What's Allowed
 
-- Full PyPI access during `install_packages` or with network enabled
+- Full PyPI access with `network=true`
 - Read/write to home directory
 - Read/write access to data mounts (default); read-only if mounted with `:ro`
 - Python execution with any installed packages
@@ -724,7 +552,7 @@ mypy src/                # Type check
 | Docker not available | Install Docker and start the daemon (`sudo systemctl start docker` on Linux, or open Docker Desktop on macOS) |
 | Sandbox image not found | Build locally with `cd docker && ./build.sh` or pull from GHCR |
 | Permission denied on home directory | `chmod -R 777 /path/to/data` |
-| Command timeout | Increase timeout: `run_code(command="...", timeout=86400)` |
+| Command timeout | Increase timeout: `sandbox_bash(command="...", timeout=86400)` |
 | Port already in use | Use `--port` flag: `onit-sandbox start --port 18206` |
 | `gpu_available` is false despite having a GPU | Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) — Docker needs it to expose GPUs to containers. See Prerequisites above. |
 | Wrong GPU used inside container | Use `--gpu` to select a specific device: `onit-sandbox start --gpu 2`. `CUDA_VISIBLE_DEVICES` on the host is also respected. |
@@ -733,12 +561,11 @@ mypy src/                # Type check
 | DataLoader crashes with shared memory error | Increase shared memory: `SANDBOX_SHM_SIZE=32g` or reduce `num_workers` |
 | OOM during training | Increase memory limit: `SANDBOX_MEMORY_LIMIT=128g`, or use quantization (`bitsandbytes`) / PEFT (`peft`) |
 | Old packages after rebuild | Stop running sessions and restart — containers use the image from when they were created |
-| Git commit fails with "tell me who you are" | This is auto-configured in new containers. If you see it, restart the session to pick up the fix. |
-| Git push fails with "no upstream branch" | Auto-recovered — the tool retries with `-u`. No action needed. |
+| Git commit fails with "tell me who you are" | Git identity is auto-configured in new containers. Restart the session to pick up the fix. |
 | Git clone/push fails with 401 | Run `onit-sandbox setup` to configure a GitHub token |
 | Git push fails with 403 | Token may lack `repo` scope — create a new token with the correct permissions |
 | `onit-sandbox setup status` shows "file" storage | Install `keyring` for OS keychain storage: `pip install keyring` |
-| Git operations hang | Network may not be reaching GitHub — check `sandbox_enable_network` and DNS settings |
+| Git operations hang | Ensure `network=true` is set and check DNS settings |
 
 ## License
 
