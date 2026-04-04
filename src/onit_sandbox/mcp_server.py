@@ -111,6 +111,7 @@ class SandboxManager:
         self._docker_available: bool | None = None
         self._gpu_available: bool | None = None
         self._gpu_devices: str = DEFAULT_GPU_DEVICES
+        self._uid, self._gid = _container_uid_gid()
 
     @staticmethod
     def _load_github_token() -> str | None:
@@ -301,7 +302,7 @@ class SandboxManager:
             "--dns",
             "8.8.4.4",
             "--user",
-            f"{_container_uid_gid()[0]}:{_container_uid_gid()[1]}",
+            f"{self._uid}:{self._gid}",
             "-e",
             "HOME=/home/sandbox",
             "-e",
@@ -374,7 +375,7 @@ class SandboxManager:
                     "sh",
                     "-c",
                     "mkdir -p /home/sandbox/.cache/pip /home/sandbox/.local"
-                    f" && chown -R {_container_uid_gid()[0]}:{_container_uid_gid()[1]} /home/sandbox",
+                    f" && chown -R {self._uid}:{self._gid} /home/sandbox",
                 ],
                 capture_output=True,
                 timeout=10,
@@ -415,7 +416,6 @@ class SandboxManager:
         raises ``KeyError`` because the host UID has no entry in the
         container's ``/etc/passwd``.
         """
-        uid, gid = _container_uid_gid()
         subprocess.run(
             [
                 "docker",
@@ -425,8 +425,8 @@ class SandboxManager:
                 container_id,
                 "sh",
                 "-c",
-                f"grep -q ':{uid}:' /etc/passwd || "
-                f"echo 'sandbox:x:{uid}:{gid}:sandbox:/home/sandbox:/bin/sh' >> /etc/passwd",
+                f"grep -q ':{self._uid}:' /etc/passwd || "
+                f"echo 'sandbox:x:{self._uid}:{self._gid}:sandbox:/home/sandbox:/bin/sh' >> /etc/passwd",
             ],
             capture_output=True,
             timeout=10,
@@ -554,7 +554,7 @@ class SandboxManager:
             "connection refused",
             "i/o timeout",
             "daemon is not running",
-            "TLS handshake timeout",
+            "tls handshake timeout",
             "temporary failure",
         )
         lower = output.lower()
@@ -618,15 +618,15 @@ class SandboxManager:
         for attempt in range(2):
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-                combined = result.stdout + result.stderr
-                # Retry on transient Docker errors (first attempt only)
-                if result.returncode != 0 and attempt == 0 and self._is_transient_docker_error(combined):
-                    logger.warning("Transient Docker error, retrying: %s", combined[:200])
-                    time.sleep(1)
-                    continue
+                if result.returncode != 0 and attempt == 0:
+                    combined = result.stdout + result.stderr
+                    if self._is_transient_docker_error(combined):
+                        logger.warning("Transient Docker error, retrying: %s", combined[:200])
+                        time.sleep(1)
+                        continue
                 if split_output:
                     return result.returncode, result.stdout, result.stderr
-                return result.returncode, combined
+                return result.returncode, result.stdout + result.stderr
             except subprocess.TimeoutExpired:
                 if split_output:
                     return -1, "", f"Command timed out after {timeout} seconds"
@@ -1134,7 +1134,7 @@ async def sandbox_bash(
 
             # Create job directory and launch the command via nohup with output capture.
             # A wrapper script writes the PID, captures exit code, and marks completion.
-            # The trap EXIT ensures status is updated even on OOM kill or SIGTERM.
+            # The trap EXIT ensures status is updated on SIGTERM or normal exit.
             wrapper = (
                 f"mkdir -p {job_dir} && "
                 f"echo 'running' > {job_dir}/status && "
